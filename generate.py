@@ -1,16 +1,21 @@
 """
-generate.py — модуль генерации AI Pulse Dashboard.
+generate.py — модуль генерации AI Pulse Dashboard (v2: Trend Radar).
 
 Читает данные из двух источников:
   1. community-brain/data/messages_YYYY-MM-DD.json  — сырые сообщения
   2. community-brain/wiki/pages/{category}/*.md     — wiki-сущности с source_ids
 
-Строит:
-  - агрегированные счётчики по неделям / дням / месяцам
-  - stacked-данные для двух видов графиков (все темы + горячие темы)
-  - топ-списки по каждой категории
+И третий вспомогательный файл:
+  3. aliases.yml                                     — словарь канонических имён
 
-Затем рендерит самодостаточный HTML-файл с Chart.js + wordcloud2.js внутри.
+Строит:
+  - агрегированные счётчики по неделям / месяцам
+  - heatmap-данные (топ-15 × последние N недель) по каждой категории
+  - stacked-данные для графика «горячие темы» (топ-6 с подписями)
+  - unified-surges (всплески по всем 4 категориям в одном блоке)
+  - топ-листы по каждой категории
+
+Затем рендерит самодостаточный HTML с Chart.js + wordcloud2.js (CDN).
 """
 
 import json
@@ -21,16 +26,50 @@ from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import yaml  # pyyaml — для чтения YAML frontmatter wiki-страниц
+import yaml  # pyyaml — для чтения YAML frontmatter wiki-страниц и aliases.yml
 
 # ── Категории сущностей (совпадают с папками в wiki/pages/) ─────────────────
-CATEGORIES = ["concepts", "entities", "people", "projects"]
+# Порядок здесь определяет порядок табов и дефолтную категорию (первая = by default).
+CATEGORIES = ["projects", "entities", "concepts", "people"]
 
-# ── Цветовая палитра для сегментов стекового графика ────────────────────────
+# Иконки и цвета категорий — используются в UI и передаются в JS.
+CATEGORY_META = {
+    "projects": {"icon": "🚀", "label": "Проекты",    "color": "#fb923c"},
+    "entities": {"icon": "🛠", "label": "Инструменты","color": "#60a5fa"},
+    "concepts": {"icon": "💡", "label": "Концепции",  "color": "#a78bfa"},
+    "people":   {"icon": "👤", "label": "Люди",       "color": "#34d399"},
+}
+
+# Палитра для сегментов стекового графика: 10 разнесённых по hue-колесу
+# оттенков. Раньше было 15 со множеством дублей (#818cf8≈#c084fc, три зелёных,
+# два жёлтых, два оранжевых, три розовых) — их глаз всё равно путает.
 PALETTE = [
-    "#818cf8", "#34d399", "#fb923c", "#f472b6", "#fbbf24",
-    "#38bdf8", "#a3e635", "#e879f9", "#2dd4bf", "#f87171",
+    "#a78bfa",  # violet
+    "#60a5fa",  # blue
+    "#38bdf8",  # sky
+    "#2dd4bf",  # teal
+    "#34d399",  # emerald
+    "#a3e635",  # lime
+    "#fbbf24",  # amber
+    "#fb923c",  # orange
+    "#f87171",  # coral
+    "#f472b6",  # pink
 ]
+
+# Окно истории: считаем данные, начиная с этой даты.
+SINCE = "2026-03-01"
+
+# Сколько сущностей показывать на столбик стекового графика (каждая колонка
+# считается независимо — в разные недели могут быть разные лица).
+STACK_TOP_N = 15
+
+# Сколько последних недель показывать в стеке «горячие темы» (5 недель даёт
+# достаточно широкие столбцы, чтобы в них помещались имена целиком).
+STACK_WEEKS = 5
+
+# Пути по умолчанию.
+ALIASES_PATH  = Path(__file__).parent / "aliases.yml"
+EXCLUDED_PATH = Path(__file__).parent / "excluded.yml"
 
 
 # ── Вспомогательные функции группировки по периодам ─────────────────────────
@@ -46,9 +85,62 @@ def get_month(date_str: str) -> str:
     return date_str[:7]
 
 
+# ── Загрузка словаря алиасов ────────────────────────────────────────────────
+
+def load_aliases(path: Path = ALIASES_PATH) -> dict[str, str]:
+    """
+    Читает aliases.yml и возвращает плоский словарь {вариант.lower() → каноническое_имя}.
+    Если файла нет или YAML битый — возвращает пустой dict (нормализация тогда no-op).
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        print(f"⚠️  aliases.yml: ошибка YAML ({e}), пропускаю нормализацию")
+        return {}
+    flat: dict[str, str] = {}
+    for canonical, variants in raw.items():
+        if not canonical:
+            continue
+        flat[canonical.lower()] = canonical
+        for v in (variants or []):
+            if v:
+                flat[v.lower()] = canonical
+    return flat
+
+
+def normalize_title(title: str, aliases: dict[str, str]) -> str:
+    """Если title — один из вариантов в aliases.yml, возвращает каноническое имя."""
+    return aliases.get(title.lower(), title)
+
+
+# ── Загрузка списка исключений ──────────────────────────────────────────────
+
+def load_excluded(path: Path = EXCLUDED_PATH) -> dict[str, set[str]]:
+    """
+    Читает excluded.yml и возвращает {category → set_of_lowercased_titles}.
+    Эти сущности полностью выкинутся из дашборда (не попадут даже в total).
+    Матчинг регистронезависимый; имена ожидаются в канонической форме (т.е.
+    уже после применения aliases.yml).
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        print(f"⚠️  excluded.yml: ошибка YAML ({e}), пропускаю исключения")
+        return {}
+    result: dict[str, set[str]] = {}
+    for cat, names in raw.items():
+        if cat in CATEGORIES and isinstance(names, list):
+            result[cat] = {n.lower() for n in names if n}
+    return result
+
+
 # ── Загрузка raw-сообщений ──────────────────────────────────────────────────
 
-def load_messages(data_dir: str, since: str = "2026-03-01") -> dict[int, str]:
+def load_messages(data_dir: str, since: str = SINCE) -> dict[int, str]:
     """
     Читает все messages_YYYY-MM-DD.json из data_dir.
     Возвращает словарь {message_id: date_str} только для сообщений >= since.
@@ -62,28 +154,37 @@ def load_messages(data_dir: str, since: str = "2026-03-01") -> dict[int, str]:
         for m in msgs:
             msg_id = m.get("id")
             date   = m.get("date", "")[:10]
-            # Берём только сообщения начиная с since
             if msg_id and date >= since:
                 id_to_date[msg_id] = date
 
     return id_to_date
 
 
-# ── Загрузка wiki-сущностей ─────────────────────────────────────────────────
+# ── Загрузка wiki-сущностей (с нормализацией имён) ──────────────────────────
 
-def load_wiki_entities(wiki_pages_dir: str) -> list[dict]:
+def load_wiki_entities(
+    wiki_pages_dir: str,
+    aliases:  dict[str, str]      | None = None,
+    excluded: dict[str, set[str]] | None = None,
+) -> list[dict]:
     """
     Читает все .md файлы из wiki/pages/{category}/.
-    Парсит YAML frontmatter и возвращает список словарей:
-      {category, title, source_ids}
+    Нормализует title через aliases, выкидывает записи из excluded и объединяет
+    страницы с одинаковым каноническим именем (source_ids склеиваются без
+    дубликатов).
+
+    Возвращает список словарей: {category, title, source_ids}
     """
-    entities = []
+    aliases  = aliases  or {}
+    excluded = excluded or {}
+
+    # Первый проход: собираем всё, нормализуя title.
+    raw_entries: list[tuple[str, str, list[int]]] = []
     for cat in CATEGORIES:
         cat_dir = os.path.join(wiki_pages_dir, cat)
         for fpath in glob.glob(os.path.join(cat_dir, "*.md")):
             with open(fpath, encoding="utf-8") as f:
                 content = f.read()
-            # YAML frontmatter между тройными дефисами
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if not match:
                 continue
@@ -93,13 +194,22 @@ def load_wiki_entities(wiki_pages_dir: str) -> list[dict]:
                 continue
             title      = (meta.get("title") or "").strip()
             source_ids = meta.get("source_ids") or []
-            if title and source_ids:
-                entities.append({
-                    "category":   cat,
-                    "title":      title,
-                    "source_ids": source_ids,
-                })
-    return entities
+            if not title or not source_ids:
+                continue
+            raw_entries.append((cat, normalize_title(title, aliases), list(source_ids)))
+
+    # Второй проход: схлопываем одноимённые (после нормализации) wiki-страницы.
+    merged: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for cat, title, ids in raw_entries:
+        merged[(cat, title)].update(ids)
+
+    # Третий проход: выкидываем исключённые.
+    result: list[dict] = []
+    for (cat, title), ids in merged.items():
+        if title.lower() in excluded.get(cat, set()):
+            continue
+        result.append({"category": cat, "title": title, "source_ids": sorted(ids)})
+    return result
 
 
 # ── Агрегация данных ────────────────────────────────────────────────────────
@@ -110,15 +220,12 @@ def aggregate(entities: list[dict], id_to_date: dict[int, str]) -> dict:
     Накапливает счётчики по:
       - total  : за всё время
       - week   : по неделям
-      - day    : по дням
       - month  : по месяцам
-    Возвращает dict со всеми счётчиками, отдельно для каждой категории.
+    (Дневная гранулярность выпилена в v2 — не используется в UI.)
     """
-    # Структура: {category: Counter{title: count}}
     total = defaultdict(Counter)
-    week  = defaultdict(lambda: defaultdict(Counter))  # [cat][week][title]
-    day   = defaultdict(lambda: defaultdict(Counter))  # [cat][day][title]
-    month = defaultdict(lambda: defaultdict(Counter))  # [cat][month][title]
+    week  = defaultdict(lambda: defaultdict(Counter))  # [cat][week_key][title]
+    month = defaultdict(lambda: defaultdict(Counter))  # [cat][month_key][title]
 
     for e in entities:
         cat, title = e["category"], e["title"]
@@ -128,61 +235,308 @@ def aggregate(entities: list[dict], id_to_date: dict[int, str]) -> dict:
                 continue
             total[cat][title] += 1
             week[cat][get_week(d)][title]  += 1
-            day[cat][d][title]             += 1
             month[cat][get_month(d)][title] += 1
 
-    return {"total": total, "week": week, "day": day, "month": month}
+    return {"total": total, "week": week, "month": month}
 
 
-# ── Построение stacked-серий ────────────────────────────────────────────────
+# ── Построение stacked-серий (rank-dataset: сортировка внутри столбца) ─────
+#
+# Проблема: обычный stacked-bar в Chart.js имеет фиксированный порядок
+# датасетов для всех колонок. Если датасет[0] — это «Claude», Claude всегда
+# внизу стека, даже если в конкретной неделе её по числу упоминаний обогнала
+# другая сущность. Это портит визуальную сортировку «самое обсуждаемое внизу».
+#
+# Решение: делаем датасеты по РАНГАМ, а не по сущностям. Датасет i — это
+# «сущность на i-м месте по убыванию в столбце», значение = её count в этом
+# периоде. Цвет каждого столбца задаём индивидуально (per-bar color) по
+# глобальному color_map, чтобы одна и та же сущность оставалась в одном
+# цвете везде. Подпись сегмента берётся из `titles[idx]` датасета.
 
-def make_stacked(cat: str, agg: dict, granularity: str) -> dict:
+def _build_rank_series(
+    periods:       list[str],
+    by_time_cat:   dict,
+    total_counter: Counter,
+    top_n:         int,
+    filter_fn                   = None,
+    tag_fn                      = None,
+    shared_color_map: dict | None = None,
+) -> dict:
     """
-    Строит данные для stacked bar chart по заданной гранулярности.
+    Строит rank-dataset структуру для стекового бара с per-column сортировкой.
 
-    Параметры:
-      cat         — категория (concepts / entities / people / projects)
-      agg         — результат aggregate()
-      granularity — 'week' | 'day' | 'month'
+    periods         — список периодов (x-ось)
+    by_time_cat     — {period → Counter{title: count}}
+    total_counter   — Counter{title: total_count} (для ранжирования цветов)
+    top_n           — сколько рангов держать на столбик
+    filter_fn       — необязательно: (title, count, period) → bool. Сущности,
+                      не прошедшие фильтр, не попадают в столбик этого периода.
+    tag_fn          — необязательно: (title, count, period) → dict. Вернувшийся
+                      dict кладётся в rank.tags[period_idx] — можно использовать
+                      на клиенте (например, метить isNew для всплесков).
+    shared_color_map — необязательно: если передан, используется вместо локального
+                      (для визуальной согласованности между разными графиками).
 
     Возвращает:
-      periods      — отсортированный список периодов
-      entities     — топ-8 сущностей по суммарным упоминаниям
-      series       — {entity: [count_per_period]}  (для графика "все темы")
-      others       — [остаток_per_period]           (то, что не вошло в топ-8)
-      hot_entities — топ-6 (для графика "горячие темы")
-      hot_series   — {entity: [count_per_period]}  (только топ-6, без "остальных")
+      periods    — как вход
+      ranks      — [top_n элементов], каждый: {counts: [...], titles: [...], tags: [...]}
+      color_map  — {title → hex} на всю вселенную этого графика
     """
-    by_time = agg[granularity]  # [cat][period][title]
-    # Минимальный ключ зависит от гранулярности
-    min_key = "2026-03" if granularity == "month" else "2026-03-01"
-    periods = sorted(k for k in by_time[cat] if k >= min_key)
-
-    # Топ-8 сущностей за весь период (стабильный порядок)
-    top8 = [t for t, _ in agg["total"][cat].most_common(8)]
-    top6 = top8[:6]
-
-    # Серия для каждой из топ-8 сущностей
-    series = {
-        ent: [by_time[cat][p].get(ent, 0) for p in periods]
-        for ent in top8
-    }
-
-    # "Остальные" — всё что не вошло в топ-8
-    others = []
+    # 1. Для каждого периода — сортированный по убыванию top_n (с фильтром).
+    period_ranks: dict[str, list[tuple[str, int]]] = {}
     for p in periods:
-        top8_sum = sum(by_time[cat][p].get(ent, 0) for ent in top8)
-        all_sum  = sum(by_time[cat][p].values())
-        others.append(max(0, all_sum - top8_sum))
+        items = Counter(by_time_cat.get(p, {})).most_common()
+        if filter_fn is not None:
+            items = [(t, c) for t, c in items if filter_fn(t, c, p)]
+        period_ranks[p] = items[:top_n]
+
+    # 2. «Ранговые» датасеты: индекс i = i-е место в столбце.
+    ranks: list[dict] = []
+    for rank_idx in range(top_n):
+        counts_row: list[int]  = []
+        titles_row: list[str]  = []
+        tags_row:   list[dict] = []
+        for p in periods:
+            row = period_ranks[p]
+            if rank_idx < len(row):
+                title, cnt = row[rank_idx]
+                counts_row.append(cnt)
+                titles_row.append(title)
+                tags_row.append(tag_fn(title, cnt, p) if tag_fn else {})
+            else:
+                counts_row.append(0)
+                titles_row.append("")
+                tags_row.append({})
+        ranks.append({"counts": counts_row, "titles": titles_row, "tags": tags_row})
+
+    # 3. Палитру раздаём по глобальному рангу в total_counter — тогда одна
+    #    сущность получит один и тот же цвет в разных графиках и в разных
+    #    категориях (если total_counter один и тот же).
+    universe: set[str] = set()
+    for row in period_ranks.values():
+        for t, _ in row:
+            universe.add(t)
+
+    if shared_color_map is not None:
+        color_map = {t: shared_color_map.get(t) for t in universe if t in shared_color_map}
+        # Добиваем цвета для сущностей, которых почему-то нет в shared (на всякий).
+        global_order = [t for t, _ in total_counter.most_common()]
+        rank_of = {t: i for i, t in enumerate(global_order)}
+        for t in universe:
+            if t not in color_map or color_map[t] is None:
+                color_map[t] = PALETTE[rank_of.get(t, 99) % len(PALETTE)]
+    else:
+        global_order = [t for t, _ in total_counter.most_common()]
+        rank_of = {t: i for i, t in enumerate(global_order)}
+        color_map = {t: PALETTE[rank_of.get(t, 99) % len(PALETTE)] for t in universe}
 
     return {
-        "periods":      periods,
-        "entities":     top8,
-        "series":       series,
-        "others":       others,
-        "hot_entities": top6,
-        "hot_series":   {ent: series[ent] for ent in top6},
+        "periods":   periods,
+        "ranks":     ranks,
+        "color_map": color_map,
     }
+
+
+def _delta_isnew_tags(
+    by_time_cat: dict,
+    all_periods: list[str],
+    window:      list[str],
+) -> dict[tuple[str, str], dict]:
+    """
+    Предрасчёт для каждой (период, title) пары:
+      - delta  = count(p) - count(prev_p)
+      - isNew  = True если count(prev_p) == 0
+    prev_p берётся из all_periods (может быть за пределами window).
+    """
+    out: dict[tuple[str, str], dict] = {}
+    for p in window:
+        idx  = all_periods.index(p)
+        prev = all_periods[idx - 1] if idx > 0 else None
+        cur_map  = by_time_cat.get(p, {})
+        prev_map = by_time_cat.get(prev, {}) if prev else {}
+        for title, cnt in cur_map.items():
+            prev_cnt = prev_map.get(title, 0)
+            out[(p, title)] = {
+                "delta": cnt - prev_cnt,
+                "isNew": prev_cnt == 0,
+            }
+    return out
+
+
+def make_stacked(
+    cat: str,
+    agg: dict,
+    granularity: str,
+    top_n:     int = STACK_TOP_N,
+    min_count: int = 2,
+) -> dict:
+    """
+    Горячие темы: в каждом столбике свой top_n по count этого периода.
+    Фильтр min_count=2 отсекает «одноразовые» сущности (их сегменты слишком
+    тонкие для подписи). К каждой точке прилагается тег {delta, isNew} —
+    клиент отрисует +N или ✨ прямо в подписи бара.
+    """
+    by_time = agg[granularity]
+    min_key = SINCE[:7] if granularity == "month" else SINCE
+    all_periods = sorted(k for k in by_time[cat] if k >= min_key)
+    periods = all_periods[-STACK_WEEKS:] if granularity == "week" else all_periods
+
+    tags = _delta_isnew_tags(by_time[cat], all_periods, periods)
+
+    return _build_rank_series(
+        periods,
+        by_time[cat],
+        agg["total"][cat],
+        top_n,
+        filter_fn=lambda t, c, p: c >= min_count,
+        tag_fn=lambda t, c, p: tags.get((p, t), {"delta": 0, "isNew": False}),
+    )
+
+
+def make_novelty_stacked(
+    cat: str,
+    agg: dict,
+    top_n:        int = STACK_TOP_N,
+    weeks_limit:  int = STACK_WEEKS,
+    min_count:    int = 2,
+) -> dict:
+    """
+    Новинки как stacked-бар: только сущности, впервые появившиеся именно в
+    этой неделе (prev_count == 0). Фильтр min_count=2 убирает одноразовый шум.
+    """
+    all_weeks = sorted(w for w in agg["week"][cat] if w >= SINCE)
+    periods   = all_weeks[-weeks_limit:]
+    tags      = _delta_isnew_tags(agg["week"][cat], all_weeks, periods)
+
+    return _build_rank_series(
+        periods,
+        agg["week"][cat],
+        agg["total"][cat],
+        top_n,
+        filter_fn=lambda t, c, p: c >= min_count and tags.get((p, t), {}).get("isNew", False),
+        tag_fn=lambda t, c, p: tags.get((p, t), {"delta": c, "isNew": True}),
+    )
+
+
+# ── Всплески ────────────────────────────────────────────────────────────────
+
+def _last_two_weeks(agg: dict) -> tuple[str | None, str | None]:
+    """Находит две самые свежие недели, в которых вообще есть данные (по всем
+    категориям). prev может быть None, если это самая первая неделя окна."""
+    all_weeks: set[str] = set()
+    for cat in CATEGORIES:
+        all_weeks.update(w for w in agg["week"][cat] if w >= SINCE)
+    weeks = sorted(all_weeks)
+    if not weeks:
+        return (None, None)
+    last = weeks[-1]
+    prev = weeks[-2] if len(weeks) >= 2 else None
+    return (last, prev)
+
+
+def _surge_items(agg: dict, cat: str, last: str, prev: str | None) -> list[dict]:
+    """Возвращает список dict-ов о сущностях, которые в `last`-неделю либо
+    выросли (delta > 0), либо появились впервые (isNew). Сортировка по delta ↓,
+    затем по count ↓."""
+    cur_map  = agg["week"][cat].get(last, {})
+    prev_map = agg["week"][cat].get(prev, {}) if prev else {}
+    items: list[dict] = []
+    for title, count in cur_map.items():
+        prev_count = prev_map.get(title, 0)
+        delta  = count - prev_count
+        is_new = prev_count == 0
+        if delta > 0 or is_new:
+            items.append({
+                "title":    title,
+                "category": cat,
+                "count":    count,
+                "delta":    delta,
+                "isNew":    is_new,
+            })
+    items.sort(key=lambda x: (-x["delta"], -x["count"]))
+    return items
+
+
+def make_hero_stats(agg: dict, min_count: int = 2) -> dict:
+    """
+    KPI-строка для hero-стрипа сверху дашборда. Считает на последнюю неделю:
+      - сколько сущностей впервые появилось (с разбивкой по категориям)
+      - сколько выросло vs прошлой недели (не-new, delta > 0)
+      - сколько упало (delta < 0)
+      - какая сущность дала самый большой прирост (delta ↑) — имя + категория.
+
+    Фильтр min_count=2 согласован с Novelty/Hot-topics графиками: одноразовый
+    шум не учитываем.
+    """
+    last, prev = _last_two_weeks(agg)
+    zero_counts = {cat: 0 for cat in CATEGORIES}
+    empty = {"total": 0, "by_cat": dict(zero_counts)}
+
+    if not last:
+        return {
+            "week": None, "prev_week": None,
+            "new": empty, "rising": empty, "falling": empty,
+            "top_gainer": None,
+        }
+
+    new     = {"total": 0, "by_cat": dict(zero_counts)}
+    rising  = {"total": 0, "by_cat": dict(zero_counts)}
+    falling = {"total": 0, "by_cat": dict(zero_counts)}
+    top_gainer: dict | None = None
+
+    for cat in CATEGORIES:
+        cur_map  = agg["week"][cat].get(last, {})
+        prev_map = agg["week"][cat].get(prev, {}) if prev else {}
+        for title, count in cur_map.items():
+            if count < min_count:
+                continue
+            prev_count = prev_map.get(title, 0)
+            delta = count - prev_count
+            is_new = prev_count == 0
+            if is_new:
+                new["total"] += 1
+                new["by_cat"][cat] += 1
+            elif delta > 0:
+                rising["total"] += 1
+                rising["by_cat"][cat] += 1
+            elif delta < 0:
+                falling["total"] += 1
+                falling["by_cat"][cat] += 1
+            # Top gainer = максимум delta (учитываем и new — у них delta = count).
+            if delta > 0 and (top_gainer is None or delta > top_gainer["delta"]):
+                top_gainer = {
+                    "title":    title,
+                    "category": cat,
+                    "count":    count,
+                    "delta":    delta,
+                    "isNew":    is_new,
+                }
+
+    return {
+        "week":        last,
+        "prev_week":   prev,
+        "new":         new,
+        "rising":      rising,
+        "falling":     falling,
+        "top_gainer":  top_gainer,
+    }
+
+
+def make_category_surges(agg: dict, max_items: int = 40) -> dict:
+    """
+    Всплески за последнюю неделю отдельно по каждой категории.
+    Структура: {cat: {week, prev_week, items}}.
+    """
+    last, prev = _last_two_weeks(agg)
+    result: dict[str, dict] = {}
+    for cat in CATEGORIES:
+        items = _surge_items(agg, cat, last, prev) if last else []
+        result[cat] = {
+            "week":      last,
+            "prev_week": prev,
+            "items":     items[:max_items],
+        }
+    return result
 
 
 # ── Финальная сборка данных ─────────────────────────────────────────────────
@@ -196,9 +550,18 @@ def build_data(data_dir: str, wiki_pages_dir: str) -> dict:
     id_to_date = load_messages(data_dir)
     print(f"   {len(id_to_date)} сообщений с датами")
 
+    print("📚 Загружаю aliases.yml...")
+    aliases = load_aliases()
+    print(f"   {len(aliases)} правил нормализации")
+
+    print("🚫 Загружаю excluded.yml...")
+    excluded = load_excluded()
+    excl_total = sum(len(s) for s in excluded.values())
+    print(f"   {excl_total} исключений")
+
     print("📚 Загружаю wiki-сущности...")
-    entities = load_wiki_entities(wiki_pages_dir)
-    print(f"   {len(entities)} сущностей")
+    entities = load_wiki_entities(wiki_pages_dir, aliases, excluded)
+    print(f"   {len(entities)} сущностей (после aliases + excluded)")
 
     print("🔢 Агрегирую данные...")
     agg = aggregate(entities, id_to_date)
@@ -206,513 +569,1182 @@ def build_data(data_dir: str, wiki_pages_dir: str) -> dict:
     def top_n(counter, n=60):
         return [[t, c] for t, c in counter.most_common(n)]
 
-    # Данные для облака слов и топ-листа (по всему периоду / по конкретному дню/неделе)
+    # Топ-листы за весь период (для правой колонки + облака слов).
     total_data = {cat: top_n(agg["total"][cat]) for cat in CATEGORIES}
 
-    # Данные по неделям и дням — для переключения периода облака
-    weeks_data: dict = {}
-    for cat in CATEGORIES:
-        for week_key, counter in agg["week"][cat].items():
-            if week_key < "2026-03-01":
-                continue
-            if week_key not in weeks_data:
-                weeks_data[week_key] = {c: [] for c in CATEGORIES}
-            weeks_data[week_key][cat] = top_n(counter, 40)
+    # Stacked «горячие темы» — недели + месяцы.
+    stacked_week  = {cat: make_stacked(cat, agg, "week")  for cat in CATEGORIES}
+    stacked_month = {cat: make_stacked(cat, agg, "month") for cat in CATEGORIES}
 
-    days_data: dict = {}
-    for cat in CATEGORIES:
-        for day_key, counter in agg["day"][cat].items():
-            if day_key < "2026-03-01":
-                continue
-            if day_key not in days_data:
-                days_data[day_key] = {c: [] for c in CATEGORIES}
-            days_data[day_key][cat] = top_n(counter, 30)
+    # Stacked «новинки» — только то, что появилось ВПЕРВЫЕ в данную неделю
+    # (prev_count == 0). Недельная разбивка; месяцы бессмысленны на коротком
+    # окне данных.
+    novelty_stacked = {cat: make_novelty_stacked(cat, agg) for cat in CATEGORIES}
 
-    # Stacked данные для трёх гранулярностей
-    stacked = {}
-    for gran in ("week", "day", "month"):
-        stacked[f"stacked_{gran}"] = {
-            cat: make_stacked(cat, agg, gran)
-            for cat in CATEGORIES
-        }
+    # Per-категорийный блок всплесков (чипы во вкладке категории) и hero-KPI.
+    category_surges = make_category_surges(agg)
+    hero_stats      = make_hero_stats(agg)
+
+    # Последняя дата сообщения во входных данных — для футера.
+    data_last_date = max(id_to_date.values()) if id_to_date else SINCE
 
     return {
-        "total": total_data,
-        "weeks": weeks_data,
-        "days":  days_data,
-        **stacked,
+        "meta": {
+            "total_entities":  len(entities),
+            "total_messages":  len(id_to_date),
+            "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "since":           SINCE,
+            "data_last_date":  data_last_date,
+        },
+        "categories":      CATEGORY_META,
+        "total":           total_data,
+        "stacked_week":    stacked_week,
+        "stacked_month":   stacked_month,
+        "novelty_stacked": novelty_stacked,
+        "category_surges": category_surges,
+        "hero_stats":      hero_stats,
     }
 
 
-# ── HTML-шаблон ─────────────────────────────────────────────────────────────
+
+# ── HTML-шаблон (Editorial «Weekly Briefing») ───────────────────────────────
+#
+# Дизайн из Claude Design: редакционная эстетика, тёплая бумага, серифы и
+# монотонные числа. Исходные файлы — .design-bundle/dima/project/
+#   • AI Pulse Weekly.html  — HTML + inline CSS
+#   • app.js                — рендер таблиц/bump-chart'а/лидерборда/новизны
+# Мы заинлайниваем и то, и другое — выход остаётся self-contained HTML.
+#
+# Shape DATA, ожидаемая app.js, совпадает с тем, что отдаёт build_data():
+#   meta{since,data_last_date,total_entities,total_messages,generated_at}
+#   hero_stats{week,prev_week,new,rising,falling,top_gainer}
+#   category_surges[cat]{week,items:[{title,count,delta,isNew,category}]}
+#   stacked_week[cat], stacked_month[cat], novelty_stacked[cat]
+#     {periods, ranks:[{counts,titles,tags:[{delta,isNew}]}]}
+#   total[cat]  → [[title,count], ...]
+
+_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AI Pulse — Weekly Briefing</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;600&family=Geist:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+/* ─────────────────────────────────────────────────────────────────────
+   AI PULSE · WEEKLY BRIEFING
+   Editorial redesign — "analyst memo" aesthetic, warm paper, ink, red.
+   ───────────────────────────────────────────────────────────────────── */
+
+:root{
+  --paper:        oklch(96.5% 0.008 82);
+  --paper-deep:   oklch(93% 0.012 82);
+  --ink:          oklch(20% 0.015 260);
+  --ink-soft:     oklch(38% 0.012 260);
+  --ink-mute:     oklch(55% 0.01 260);
+  --rule:         oklch(82% 0.015 80);
+  --rule-soft:    oklch(88% 0.012 80);
+
+  --red:          oklch(52% 0.17 25);    /* rising / hot */
+  --red-soft:     oklch(52% 0.17 25 / 0.1);
+  --blue:         oklch(48% 0.09 245);   /* new */
+  --blue-soft:    oklch(48% 0.09 245 / 0.1);
+  --grey:         oklch(55% 0.005 260);  /* falling */
+
+  --cat-projects: oklch(52% 0.14 50);
+  --cat-entities: oklch(48% 0.09 245);
+  --cat-concepts: oklch(46% 0.12 300);
+  --cat-people:   oklch(50% 0.10 165);
+
+  --serif:  "Fraunces", "Instrument Serif", Georgia, serif;
+  --sans:   "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono:   "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--paper);color:var(--ink)}
+body{
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+  padding-bottom:60px;
+}
+
+/* ── Shell ─────────────────────────────────────────────────── */
+.shell{max-width:1180px;margin:0 auto;padding:0 36px}
+@media(max-width:720px){.shell{padding:0 20px}}
+
+/* ── Masthead ──────────────────────────────────────────────── */
+.masthead{
+  padding:26px 0 20px;
+  border-bottom:1.5px solid var(--ink);
+  display:grid;
+  grid-template-columns:1fr auto;
+  align-items:end;
+  gap:20px;
+}
+.masthead-left .eyebrow{
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:0.18em;
+  text-transform:uppercase;
+  color:var(--ink-soft);
+  margin-bottom:8px;
+  display:flex;align-items:center;gap:10px;
+}
+.eyebrow .dot{
+  width:7px;height:7px;border-radius:50%;
+  background:var(--red);
+  box-shadow:0 0 0 3px oklch(52% 0.17 25 / 0.18);
+  animation:pulse 2.4s ease-in-out infinite;
+}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+.wordmark{
+  font-family:var(--serif);
+  font-weight:400;
+  font-size:clamp(36px, 6vw, 64px);
+  line-height:0.95;
+  letter-spacing:-0.02em;
+  font-variation-settings:"opsz" 144, "SOFT" 30;
+}
+.wordmark em{font-style:italic;font-weight:300}
+
+.masthead-right{
+  font-family:var(--mono);
+  font-size:11px;
+  color:var(--ink-soft);
+  text-align:right;
+  line-height:1.7;
+}
+.masthead-right b{color:var(--ink);font-weight:500}
+
+@media(max-width:720px){
+  .masthead{grid-template-columns:1fr;align-items:start}
+  .masthead-right{text-align:left}
+}
+
+/* ── Issue strip: dateline + volume + metrics ──────────────── */
+.dateline{
+  display:flex;flex-wrap:wrap;align-items:center;gap:0 22px;
+  padding:10px 0;
+  border-bottom:1px solid var(--rule);
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:0.04em;
+  color:var(--ink-soft);
+  text-transform:uppercase;
+}
+.dateline span b{color:var(--ink);font-weight:500}
+
+/* ── Lede (Pulse sentence) ─────────────────────────────────── */
+.lede{
+  padding:36px 0 30px;
+  border-bottom:1px solid var(--rule);
+  display:grid;
+  grid-template-columns:72px 1fr;
+  gap:24px;
+}
+.lede-tag{
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  color:var(--red);
+  border-top:2px solid var(--red);
+  padding-top:10px;
+  line-height:1.3;
+}
+.lede-body{
+  font-family:var(--serif);
+  font-weight:300;
+  font-size:clamp(22px, 2.6vw, 30px);
+  line-height:1.3;
+  letter-spacing:-0.012em;
+  color:var(--ink);
+  text-wrap:pretty;
+}
+.lede-body .hl{
+  font-style:italic;
+  font-weight:400;
+  color:var(--red);
+  border-bottom:1px solid oklch(52% 0.17 25 / 0.4);
+  padding-bottom:1px;
+}
+.lede-body .num{
+  font-family:var(--mono);
+  font-weight:500;
+  font-size:0.85em;
+  font-style:normal;
+  background:var(--red-soft);
+  color:var(--red);
+  padding:1px 8px;
+  border-radius:3px;
+  margin:0 2px;
+  letter-spacing:-0.01em;
+}
+.lede-body .num.blue{background:var(--blue-soft);color:var(--blue)}
+.lede-body .num.grey{background:oklch(0% 0 0 / 0.05);color:var(--ink-soft)}
+
+/* ── Pulse meter (4 tick columns) ──────────────────────────── */
+.meter{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:0;
+  border-bottom:1px solid var(--rule);
+}
+@media(max-width:700px){.meter{grid-template-columns:repeat(2,1fr)}}
+.meter-cell{
+  padding:22px 20px 24px;
+  border-right:1px solid var(--rule);
+  position:relative;
+}
+.meter-cell:last-child{border-right:none}
+@media(max-width:700px){
+  .meter-cell:nth-child(2){border-right:none}
+  .meter-cell:nth-child(-n+2){border-bottom:1px solid var(--rule)}
+}
+.meter-cell::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:2px;
+  background:var(--tone, var(--ink));
+}
+.meter-cell[data-tone=new]     {--tone:var(--blue)}
+.meter-cell[data-tone=rising]  {--tone:var(--red)}
+.meter-cell[data-tone=falling] {--tone:var(--grey)}
+.meter-cell[data-tone=gainer]  {--tone:var(--ink)}
+
+.meter-label{
+  font-family:var(--mono);
+  font-size:10.5px;
+  letter-spacing:0.14em;
+  text-transform:uppercase;
+  color:var(--ink-mute);
+  margin-bottom:12px;
+  display:flex;justify-content:space-between;align-items:baseline;
+}
+.meter-label .glyph{
+  font-family:var(--serif);
+  font-style:italic;
+  font-size:20px;
+  color:var(--tone);
+  letter-spacing:normal;
+  text-transform:none;
+}
+.meter-value{
+  font-family:var(--serif);
+  font-weight:400;
+  font-size:52px;
+  line-height:0.95;
+  letter-spacing:-0.03em;
+  color:var(--ink);
+  font-variant-numeric:tabular-nums;
+  margin-bottom:14px;
+}
+.meter-value.small{font-size:22px;font-weight:500;letter-spacing:-0.01em;line-height:1.2}
+.meter-breakdown{
+  font-family:var(--mono);
+  font-size:11px;
+  color:var(--ink-mute);
+  display:flex;flex-wrap:wrap;gap:4px 12px;
+}
+.meter-breakdown .bd{display:inline-flex;align-items:center;gap:5px}
+.meter-breakdown .bd::before{
+  content:"";width:6px;height:6px;border-radius:1px;background:var(--bd-c);
+  display:inline-block;
+}
+.meter-sub{
+  font-family:var(--mono);
+  font-size:11px;
+  color:var(--ink-mute);
+  line-height:1.5;
+}
+.meter-sub .delta{color:var(--red);font-weight:500}
+.meter-sub .delta.new{color:var(--blue)}
+
+/* ── Section header ────────────────────────────────────────── */
+.section{padding:40px 0 10px;border-bottom:1px solid var(--rule)}
+.section-head{
+  display:grid;
+  grid-template-columns:60px 1fr auto;
+  gap:18px;
+  align-items:baseline;
+  margin-bottom:22px;
+}
+.section-num{
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:0.1em;
+  color:var(--ink-mute);
+  border-top:2px solid var(--ink);
+  padding-top:8px;
+}
+.section-title{
+  font-family:var(--serif);
+  font-weight:400;
+  font-size:clamp(24px, 3vw, 32px);
+  line-height:1.1;
+  letter-spacing:-0.015em;
+  color:var(--ink);
+}
+.section-title em{font-style:italic;font-weight:300}
+.section-tools{
+  display:flex;gap:2px;align-items:center;
+  font-family:var(--mono);font-size:11px;color:var(--ink-mute);
+}
+.section-desc{
+  grid-column:2/4;
+  font-size:13.5px;
+  line-height:1.55;
+  color:var(--ink-soft);
+  max-width:68ch;
+  margin-top:-14px;
+  margin-bottom:4px;
+}
+@media(max-width:720px){
+  .section-head{grid-template-columns:auto 1fr;grid-template-rows:auto auto}
+  .section-tools{grid-column:1/-1;justify-self:start}
+  .section-desc{grid-column:1/-1;margin-top:0}
+}
+
+/* ── Category tabs (filmstrip) ─────────────────────────────── */
+.catbar-wrap{
+  position:sticky;top:0;z-index:30;
+  background:var(--paper);
+  border-bottom:1px solid var(--ink);
+  margin:0 -36px;
+  padding:0 36px;
+}
+@media(max-width:720px){
+  .catbar-wrap{margin:0 -20px;padding:0 20px}
+}
+.catbar{
+  display:flex;gap:0;overflow-x:auto;
+  -webkit-overflow-scrolling:touch;
+}
+.cat-btn{
+  flex:1 1 auto;
+  min-width:120px;
+  padding:14px 16px 12px;
+  background:transparent;
+  border:none;
+  border-right:1px solid var(--rule);
+  cursor:pointer;
+  text-align:left;
+  font-family:inherit;
+  color:var(--ink-mute);
+  transition:background .12s, color .12s;
+  position:relative;
+}
+.cat-btn:last-child{border-right:none}
+.cat-btn:hover{background:var(--paper-deep);color:var(--ink-soft)}
+.cat-btn.active{color:var(--ink);background:var(--paper-deep)}
+.cat-btn.active::before{
+  content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;
+  background:var(--cat-c);
+}
+.cat-btn[data-cat=projects]{--cat-c:var(--cat-projects)}
+.cat-btn[data-cat=entities]{--cat-c:var(--cat-entities)}
+.cat-btn[data-cat=concepts]{--cat-c:var(--cat-concepts)}
+.cat-btn[data-cat=people]  {--cat-c:var(--cat-people)}
+
+.cat-btn .cat-kicker{
+  font-family:var(--mono);
+  font-size:10px;letter-spacing:0.14em;text-transform:uppercase;
+  color:var(--ink-mute);display:block;margin-bottom:3px;
+}
+.cat-btn.active .cat-kicker{color:var(--cat-c)}
+.cat-btn .cat-name{
+  font-family:var(--serif);
+  font-size:20px;line-height:1.1;font-weight:400;letter-spacing:-0.01em;
+}
+.cat-btn .cat-count{
+  font-family:var(--mono);
+  font-size:11px;color:var(--ink-mute);margin-top:2px;
+}
+
+/* ── Surges table ──────────────────────────────────────────── */
+.surge-table{
+  width:100%;border-collapse:collapse;
+  font-family:var(--sans);
+}
+.surge-table th{
+  text-align:left;
+  font-family:var(--mono);font-weight:400;font-size:10.5px;
+  letter-spacing:0.12em;text-transform:uppercase;color:var(--ink-mute);
+  padding:8px 10px 8px 0;border-bottom:1px solid var(--ink);
+}
+.surge-table th.num{text-align:right}
+.surge-table td{
+  padding:13px 10px 13px 0;
+  border-bottom:1px solid var(--rule);
+  vertical-align:middle;
+  font-size:14.5px;
+}
+.surge-table tr:last-child td{border-bottom:none}
+.surge-table td.rank{
+  font-family:var(--mono);font-size:11px;color:var(--ink-mute);width:34px;
+  font-variant-numeric:tabular-nums;
+}
+.surge-table td.title{color:var(--ink);font-weight:500}
+.surge-table td.title .badge-new{
+  display:inline-block;
+  font-family:var(--mono);font-size:9.5px;letter-spacing:0.1em;
+  color:var(--blue);background:var(--blue-soft);
+  padding:2px 6px;border-radius:2px;margin-left:8px;
+  vertical-align:1px;text-transform:uppercase;
+}
+.surge-table td.spark{width:38%;padding-right:20px}
+.spark-row{display:flex;align-items:center;gap:10px}
+.spark-bar{
+  height:8px;flex:1;background:var(--paper-deep);position:relative;border-radius:1px;
+}
+.spark-bar-prev{
+  position:absolute;top:0;left:0;bottom:0;background:oklch(0% 0 0 / 0.12);border-radius:1px;
+}
+.spark-bar-now{
+  position:absolute;top:0;left:0;bottom:0;background:var(--cat-c, var(--red));border-radius:1px;
+}
+.spark-bar.is-new .spark-bar-now{background:var(--blue)}
+.surge-table td.delta{
+  font-family:var(--mono);text-align:right;width:80px;
+  font-variant-numeric:tabular-nums;font-size:13px;
+  color:var(--red);font-weight:500;
+}
+.surge-table td.delta.new{color:var(--blue)}
+.surge-table td.count{
+  font-family:var(--mono);text-align:right;width:56px;
+  font-variant-numeric:tabular-nums;font-size:13px;color:var(--ink);font-weight:500;
+}
+
+/* ── Bump chart (hot themes) ───────────────────────────────── */
+.bump-wrap{position:relative;width:100%}
+#bump-svg{display:block;width:100%;height:auto;overflow:visible}
+
+.bump-legend{
+  display:flex;flex-wrap:wrap;gap:2px 18px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-mute);
+  margin-top:14px;
+  padding-top:12px;border-top:1px solid var(--rule);
+}
+.bump-legend span b{color:var(--ink);font-weight:500}
+.bump-legend .sw{
+  display:inline-block;width:14px;height:2px;vertical-align:2px;margin-right:5px;
+}
+
+/* ── Tabbed granularity (segmented) ────────────────────────── */
+.seg{
+  display:inline-flex;border:1px solid var(--ink);border-radius:0;overflow:hidden;
+  font-family:var(--mono);font-size:11px;letter-spacing:0.1em;text-transform:uppercase;
+}
+.seg button{
+  background:transparent;border:none;padding:5px 11px;cursor:pointer;
+  color:var(--ink-mute);font-family:inherit;font-size:inherit;letter-spacing:inherit;
+  text-transform:inherit;border-right:1px solid var(--rule);
+}
+.seg button:last-child{border-right:none}
+.seg button:hover{color:var(--ink)}
+.seg button.active{background:var(--ink);color:var(--paper)}
+
+/* ── Leaderboard (Top-15) ──────────────────────────────────── */
+.leader-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 48px}
+@media(max-width:700px){.leader-grid{grid-template-columns:1fr}}
+.leader-row{
+  display:grid;grid-template-columns:28px 1fr auto;gap:12px;
+  padding:10px 0;border-bottom:1px solid var(--rule);
+  align-items:baseline;
+}
+.leader-row:last-child{border-bottom:none}
+.leader-rank{
+  font-family:var(--mono);font-size:11px;color:var(--ink-mute);
+  font-variant-numeric:tabular-nums;text-align:right;
+  border-right:1px solid var(--rule);padding-right:10px;
+}
+.leader-row.top3 .leader-rank{color:var(--red);font-weight:600}
+.leader-name{
+  font-family:var(--sans);font-size:14.5px;color:var(--ink);font-weight:500;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  display:flex;align-items:baseline;gap:8px;
+}
+.leader-name .dots{
+  flex:1;border-bottom:1px dotted var(--rule);
+  transform:translateY(-4px);min-width:20px;
+}
+.leader-count{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  font-size:13px;color:var(--ink);font-weight:500;padding-left:4px;
+}
+
+/* ── Novelty: list of new entries with weekly sparks ──────── */
+.novelty-list{display:grid;grid-template-columns:1fr;gap:0}
+.novelty-row{
+  display:grid;
+  grid-template-columns:110px 1fr 200px 60px;
+  gap:18px;
+  padding:14px 0;
+  border-bottom:1px solid var(--rule);
+  align-items:center;
+}
+.novelty-row:last-child{border-bottom:none}
+.novelty-when{
+  font-family:var(--mono);font-size:11px;color:var(--ink-mute);letter-spacing:0.05em;
+}
+.novelty-name{
+  font-family:var(--serif);font-size:20px;font-weight:400;color:var(--ink);
+  letter-spacing:-0.01em;line-height:1.15;
+}
+.novelty-name em{font-style:italic;font-weight:300;color:var(--ink-mute);font-size:0.72em;margin-left:6px;letter-spacing:0;font-family:var(--sans)}
+.novelty-spark{display:flex;gap:3px;align-items:flex-end;height:28px}
+.novelty-spark .tick{
+  flex:1;background:var(--paper-deep);min-height:2px;position:relative;border-radius:1px;
+}
+.novelty-spark .tick.live{background:var(--blue)}
+.novelty-count{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  text-align:right;font-size:14px;color:var(--ink);font-weight:500;
+}
+@media(max-width:720px){
+  .novelty-row{grid-template-columns:1fr auto;grid-template-rows:auto auto}
+  .novelty-when{grid-row:1;font-size:10px}
+  .novelty-count{grid-row:1;text-align:right}
+  .novelty-name{grid-column:1/-1;grid-row:2;font-size:17px}
+  .novelty-spark{grid-column:1/-1;grid-row:3;margin-top:6px}
+}
+
+/* ── Colophon ──────────────────────────────────────────────── */
+.colophon{
+  padding:36px 0 0;
+  border-top:2px solid var(--ink);
+  margin-top:24px;
+  display:grid;grid-template-columns:1fr 1fr 1fr;gap:32px;
+  font-family:var(--mono);font-size:11px;line-height:1.7;color:var(--ink-soft);
+}
+@media(max-width:720px){.colophon{grid-template-columns:1fr;gap:20px}}
+.colophon h4{
+  font-family:var(--serif);font-weight:400;font-style:italic;
+  font-size:15px;color:var(--ink);margin-bottom:6px;letter-spacing:-0.01em;
+}
+.colophon code{background:var(--paper-deep);padding:1px 5px;border-radius:2px}
+
+/* Accent variants (изменяются через data-accent на <body>) */
+body[data-accent=crimson]{--red:oklch(52% 0.17 25);--red-soft:oklch(52% 0.17 25 / 0.1)}
+body[data-accent=forest] {--red:oklch(45% 0.12 155);--red-soft:oklch(45% 0.12 155 / 0.1)}
+body[data-accent=ink]    {--red:oklch(25% 0.02 260);--red-soft:oklch(25% 0.02 260 / 0.08)}
+
+body[data-density=spacious] .section{padding:56px 0 10px}
+body[data-density=spacious] .lede{padding:56px 0 44px}
+
+body[data-serif=fraunces]   {--serif:"Fraunces", Georgia, serif}
+body[data-serif=instrument] {--serif:"Instrument Serif", Georgia, serif}
+
+@media print{.catbar-wrap{position:static}}
+</style>
+</head>
+<body data-accent="crimson" data-density="normal" data-serif="fraunces">
+
+<div class="shell">
+
+  <!-- ══════ MASTHEAD ══════ -->
+  <header class="masthead">
+    <div class="masthead-left">
+      <div class="eyebrow"><span class="dot"></span> AI Pulse · Weekly Briefing</div>
+      <h1 class="wordmark">Что обсуждает <em>AI-сообщество</em><br>прямо сейчас.</h1>
+    </div>
+    <div class="masthead-right">
+      <div>№ <b id="issue-no">—</b> · <b id="issue-date">—</b></div>
+      <div>Окно <b id="window-range">—</b></div>
+      <div><b id="entity-count">—</b> сущностей / <b id="msg-count">—</b> сообщений</div>
+    </div>
+  </header>
+
+  <!-- ══════ DATELINE ══════ -->
+  <div class="dateline">
+    <span>Источник: <b>Telegram · AI-каналы</b></span>
+    <span>Неделя <b id="dl-week">—</b></span>
+    <span>Пред. <b id="dl-prev">—</b></span>
+    <span style="margin-left:auto">alias <code style="font-family:inherit">aliases.yml</code></span>
+  </div>
+
+  <!-- ══════ LEDE ══════ -->
+  <section class="lede">
+    <div class="lede-tag">Pulse<br>0419</div>
+    <p class="lede-body" id="lede-body">—</p>
+  </section>
+
+  <!-- ══════ METER ══════ -->
+  <section class="meter" id="meter"></section>
+
+  <!-- ══════ CATEGORY TABS (sticky) ══════ -->
+  <div class="catbar-wrap">
+    <nav class="catbar" id="catbar"></nav>
+  </div>
+
+  <!-- § 01 — Surges -->
+  <section class="section" id="sec-surges">
+    <div class="section-head">
+      <div class="section-num">§ 01</div>
+      <h2 class="section-title">Всплески недели <em id="surge-cat-label">—</em></h2>
+      <div class="section-tools" id="surge-week">—</div>
+      <p class="section-desc">Сущности с наибольшим приростом упоминаний за последнюю неделю относительно предыдущей. Тёмная полоса — прошлая неделя, цветная — текущая.</p>
+    </div>
+    <div id="surge-table-wrap"></div>
+  </section>
+
+  <!-- § 02 — Bump / Hot themes -->
+  <section class="section" id="sec-hot">
+    <div class="section-head">
+      <div class="section-num">§ 02</div>
+      <h2 class="section-title">Траектории топ-тем <em id="hot-cat-label">—</em></h2>
+      <div class="section-tools">
+        <div class="seg" id="gran-btns">
+          <button class="active" data-gran="week">Нед.</button>
+          <button data-gran="month">Месяц</button>
+        </div>
+      </div>
+      <p class="section-desc">Как меняется ранг каждой темы от периода к периоду. Линии, поднимающиеся к верху, — темы, забирающиеся в топ. Точка = ранг в столбце, размер = доля упоминаний этой темы в столбце.</p>
+    </div>
+    <div class="bump-wrap">
+      <svg id="bump-svg" viewBox="0 0 1180 620" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+    <div class="bump-legend">
+      <span><span class="sw" style="background:var(--red)"></span><b>Жирная линия</b> — тема продержалась весь период</span>
+      <span><span class="sw" style="background:var(--blue);height:2px;border-top:1px dashed var(--blue)"></span><b>Пунктир</b> — появилась впервые</span>
+      <span><b>Круг</b> — ранг и масса упоминаний</span>
+    </div>
+  </section>
+
+  <!-- § 03 — Leaderboard -->
+  <section class="section" id="sec-top">
+    <div class="section-head">
+      <div class="section-num">§ 03</div>
+      <h2 class="section-title">Таблица рекордов <em id="top-cat-label">—</em></h2>
+      <div class="section-tools">за всё окно</div>
+      <p class="section-desc">Абсолютный рейтинг за всё окно данных. Топ-3 отмечены акцентным цветом.</p>
+    </div>
+    <div class="leader-grid" id="leader-grid"></div>
+  </section>
+
+  <!-- § 04 — Novelty -->
+  <section class="section" id="sec-novelty">
+    <div class="section-head">
+      <div class="section-num">§ 04</div>
+      <h2 class="section-title">Впервые замечено <em id="novelty-cat-label">—</em></h2>
+      <div class="section-tools">хронология</div>
+      <p class="section-desc">Сущности, о которых на конкретной неделе заговорили впервые. Точки справа — по какой неделе пришло упоминание.</p>
+    </div>
+    <div id="novelty-list" class="novelty-list"></div>
+  </section>
+
+  <!-- Colophon -->
+  <footer class="colophon">
+    <div>
+      <h4>О выпуске</h4>
+      Еженедельный отчёт о темах, которые обсуждает русскоязычное AI-комьюнити в Telegram. Автоматическая агрегация сущностей из сообщений с последующей нормализацией.
+    </div>
+    <div>
+      <h4>Данные</h4>
+      Окно: <span id="col-window">—</span><br>
+      Сущностей: <span id="col-entities">—</span><br>
+      Сообщений: <span id="col-msgs">—</span><br>
+      Последняя точка: <span id="col-last">—</span>
+    </div>
+    <div>
+      <h4>Сборка</h4>
+      Собрано: <span id="col-built">—</span><br>
+      Алиасы: <code>aliases.yml</code><br>
+      Исключения: <code>excluded.yml</code>
+    </div>
+  </footer>
+</div>
+
+<script>window.DATA = __DATA_JSON__;</script>
+<script>__APP_JS__</script>
+</body>
+</html>
+"""
+
+# app.js из Claude Design, заинлайненный. Tweaks-панель и editmode-IPC
+# убраны — они нужны только внутри Claude Design iframe.
+_APP_JS = r"""
+(function(){
+'use strict';
+
+const D = window.DATA;
+const CAT_META = {
+  projects: {label:"Проекты",     kicker:"§ Projects", var:"--cat-projects"},
+  entities: {label:"Инструменты", kicker:"§ Tools",    var:"--cat-entities"},
+  concepts: {label:"Концепции",   kicker:"§ Concepts", var:"--cat-concepts"},
+  people:   {label:"Люди",        kicker:"§ People",   var:"--cat-people"}
+};
+const CAT_ORDER = ["projects","entities","concepts","people"];
+const CAT_COLOR = {
+  projects:"oklch(52% 0.14 50)",
+  entities:"oklch(48% 0.09 245)",
+  concepts:"oklch(46% 0.12 300)",
+  people:  "oklch(50% 0.10 165)"
+};
+
+let currentCat  = "projects";
+let currentGran = "week";
+
+// ── Format ───────────────────────────────────────────────────────────
+const MONTHS      = ["янв","фев","мар","апр","мая","июн","июл","авг","сен","окт","ноя","дек"];
+const MONTHS_FULL = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+function fmtDate(s){const d=new Date(s);return `${d.getDate()} ${MONTHS[d.getMonth()]}`}
+function fmtWeek(s){const d=new Date(s),e=new Date(d);e.setDate(d.getDate()+6);return fmtDate(s)+"–"+fmtDate(e.toISOString().slice(0,10))}
+function fmtMonth(s){return new Date(s+"-01").toLocaleDateString("ru-RU",{month:"short"})}
+function fmtFullDate(s){const d=new Date(s);return `${d.getDate()} ${MONTHS_FULL[d.getMonth()]} ${d.getFullYear()}`}
+
+function el(tag, cls, text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+function setText(id,t){const e=document.getElementById(id);if(e)e.textContent=t}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+
+// ── Masthead / dateline / colophon ──────────────────────────────────
+function fillChrome(){
+  const m = D.meta, h = D.hero_stats;
+  const d = new Date(m.data_last_date);
+  const onejan = new Date(d.getFullYear(),0,1);
+  const week = Math.ceil((((d - onejan)/86400000) + onejan.getDay()+1)/7);
+  setText("issue-no", String(week).padStart(2,"0"));
+  setText("issue-date", fmtFullDate(m.generated_at.slice(0,10)));
+  setText("window-range", m.since + " → " + m.data_last_date);
+  setText("entity-count", m.total_entities.toLocaleString("ru-RU"));
+  setText("msg-count", m.total_messages.toLocaleString("ru-RU"));
+  setText("dl-week", h && h.week ? fmtWeek(h.week) : "—");
+  setText("dl-prev", h && h.prev_week ? fmtWeek(h.prev_week) : "—");
+  setText("col-window", m.since + " → " + m.data_last_date);
+  setText("col-entities", m.total_entities.toLocaleString("ru-RU"));
+  setText("col-msgs", m.total_messages.toLocaleString("ru-RU"));
+  setText("col-last", m.data_last_date);
+  setText("col-built", m.generated_at);
+}
+
+// ── Lede ────────────────────────────────────────────────────────────
+function renderLede(){
+  const h = D.hero_stats;
+  if (!h || !h.week) return;
+  const g = h.top_gainer;
+  const gMeta = g ? CAT_META[g.category] : null;
+  const gCat = g ? gMeta.label.toLowerCase() : "";
+
+  let domCat = null, domN = 0;
+  for (const c of CAT_ORDER){
+    const n = h.new.by_cat[c]||0;
+    if (n > domN){domN=n;domCat=c}
+  }
+  const domLabel = domCat ? CAT_META[domCat].label.toLowerCase() : "";
+
+  const lede = document.getElementById("lede-body");
+  lede.innerHTML = `На этой неделе в эфире <span class="num blue">${h.new.total}</span> новых сущностей — больше всего среди <em>${domLabel}</em> (${domN}). <span class="hl">${h.rising.total}</span> тем <span class="hl">растут</span>, <span class="num grey">${h.falling.total}</span> угасают.` +
+    (g ? ` Главный всплеск — <em>${escapeHtml(g.title)}</em> ${g.isNew ? '<span class="num blue">впервые</span>' : `<span class="num">+${g.delta}</span>`} (${g.count} упоминаний, ${gCat}).` : "");
+}
+
+// ── Meter ────────────────────────────────────────────────────────────
+function renderMeter(){
+  const h = D.hero_stats;
+  const meter = document.getElementById("meter");
+  meter.innerHTML = "";
+  if (!h || !h.week){ meter.appendChild(el("div","meter-cell","Нет данных")); return; }
+
+  function breakdown(byCat){
+    const wrap = el("div","meter-breakdown");
+    for (const c of CAT_ORDER){
+      const n = byCat[c]||0;
+      if (!n) continue;
+      const bd = el("span","bd");
+      bd.style.setProperty("--bd-c", CAT_COLOR[c]);
+      bd.textContent = `${CAT_META[c].label.slice(0,4).toLowerCase()}. ${n}`;
+      wrap.appendChild(bd);
+    }
+    return wrap;
+  }
+  function cell(tone, label, glyph, val, extra){
+    const c = el("div","meter-cell");
+    c.dataset.tone = tone;
+    const lbl = el("div","meter-label");
+    lbl.appendChild(el("span","",label));
+    lbl.appendChild(el("span","glyph",glyph));
+    c.appendChild(lbl);
+    c.appendChild(el("div","meter-value", val));
+    if (extra) c.appendChild(extra);
+    return c;
+  }
+  meter.appendChild(cell("new",    "Новинок", "N", h.new.total,    breakdown(h.new.by_cat)));
+  meter.appendChild(cell("rising", "Растут",  "↗", h.rising.total, breakdown(h.rising.by_cat)));
+  meter.appendChild(cell("falling","Падают",  "↘", h.falling.total,breakdown(h.falling.by_cat)));
+
+  const g = h.top_gainer;
+  const gc = el("div","meter-cell");
+  gc.dataset.tone = "gainer";
+  const lbl = el("div","meter-label");
+  lbl.appendChild(el("span","","Всплеск №1"));
+  lbl.appendChild(el("span","glyph","★"));
+  gc.appendChild(lbl);
+  if (g){
+    gc.appendChild(el("div","meter-value small", g.title));
+    const sub = el("div","meter-sub");
+    const meta = CAT_META[g.category];
+    sub.innerHTML = `${meta.label.toLowerCase()} · ${g.count} упом. · ` +
+      (g.isNew ? `<span class="delta new">впервые</span>` : `<span class="delta">+${g.delta} нед/нед</span>`);
+    gc.appendChild(sub);
+  } else {
+    gc.appendChild(el("div","meter-value","—"));
+  }
+  meter.appendChild(gc);
+}
+
+// ── Category tabs ────────────────────────────────────────────────────
+function renderCatbar(){
+  const bar = document.getElementById("catbar");
+  bar.innerHTML = "";
+  CAT_ORDER.forEach(c=>{
+    const meta = CAT_META[c];
+    const btn = el("button","cat-btn"+(c===currentCat?" active":""));
+    btn.dataset.cat = c;
+    btn.innerHTML = `
+      <span class="cat-kicker">${meta.kicker}</span>
+      <span class="cat-name">${meta.label}</span>
+      <span class="cat-count">${(D.total[c]||[]).length} сущностей</span>`;
+    btn.addEventListener("click", ()=>{
+      currentCat = c;
+      document.querySelectorAll(".cat-btn").forEach(b=>b.classList.toggle("active", b.dataset.cat===c));
+      document.documentElement.style.setProperty("--cat-c", CAT_COLOR[c]);
+      renderCategory();
+    });
+    bar.appendChild(btn);
+  });
+  document.documentElement.style.setProperty("--cat-c", CAT_COLOR[currentCat]);
+}
+
+// ── Surges table ─────────────────────────────────────────────────────
+function renderSurges(){
+  const cs = D.category_surges[currentCat] || {week:null, items:[]};
+  const meta = CAT_META[currentCat];
+  setText("surge-cat-label", "— " + meta.label.toLowerCase());
+  setText("surge-week", cs.week ? fmtWeek(cs.week) : "—");
+
+  const wrap = document.getElementById("surge-table-wrap");
+  wrap.innerHTML = "";
+  if (!cs.items.length){ wrap.appendChild(el("p","section-desc","Нет всплесков в этой категории.")); return; }
+  const items = cs.items.slice(0, 12);
+  const maxC = Math.max(...items.map(x=>x.count));
+
+  const table = el("table","surge-table");
+  table.innerHTML = `<thead><tr>
+    <th>#</th><th>Сущность</th><th>Нед. / нед.</th>
+    <th class="num">Δ</th><th class="num">Упом.</th>
+  </tr></thead>`;
+  const tb = el("tbody");
+  items.forEach((x,i)=>{
+    const row = el("tr");
+    const prev = x.isNew ? 0 : Math.max(0, x.count - x.delta);
+    const pctNow  = Math.max(4, Math.round(x.count/maxC*100));
+    const pctPrev = Math.max(0, Math.round(prev/maxC*100));
+    row.innerHTML = `
+      <td class="rank">${String(i+1).padStart(2,"0")}</td>
+      <td class="title">${escapeHtml(x.title)}${x.isNew?'<span class="badge-new">NEW</span>':''}</td>
+      <td class="spark">
+        <div class="spark-row">
+          <div class="spark-bar ${x.isNew?'is-new':''}">
+            <div class="spark-bar-prev" style="width:${pctPrev}%"></div>
+            <div class="spark-bar-now" style="width:${pctNow}%;background:${x.isNew?'var(--blue)':CAT_COLOR[currentCat]}"></div>
+          </div>
+        </div>
+      </td>
+      <td class="delta ${x.isNew?'new':''}">${x.isNew?'new':'+'+x.delta}</td>
+      <td class="count">${x.count}</td>`;
+    tb.appendChild(row);
+  });
+  table.appendChild(tb);
+  wrap.appendChild(table);
+}
+
+// ── Bump chart (rank over time) ──────────────────────────────────────
+function renderBump(){
+  const key = currentGran === "week" ? "stacked_week" : "stacked_month";
+  const sd = D[key][currentCat];
+  setText("hot-cat-label", "— " + CAT_META[currentCat].label.toLowerCase());
+  const svg = document.getElementById("bump-svg");
+  svg.innerHTML = "";
+
+  const periods = sd.periods;
+  const N = periods.length;
+  const R = sd.ranks.length;
+
+  const tracks = new Map();
+  for (let r = 0; r < R; r++){
+    const rank = sd.ranks[r];
+    for (let pi = 0; pi < N; pi++){
+      const title = rank.titles[pi];
+      const count = rank.counts[pi];
+      if (!title || !count) continue;
+      const tag = (rank.tags && rank.tags[pi]) || {};
+      if (!tracks.has(title)) tracks.set(title, []);
+      tracks.get(title).push({pi, rank:r, count, isNew:!!tag.isNew, delta:tag.delta||0});
+    }
+  }
+
+  const W = 1180, H = 620;
+  const padL = 48, padR = 220, padT = 30, padB = 34;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const xStep = N > 1 ? plotW / (N - 1) : 0;
+  const yStep = plotH / (R - 1 || 1);
+  function xOf(pi){return padL + pi * xStep}
+  function yOf(rank){return padT + rank * yStep}
+
+  let maxCount = 0;
+  tracks.forEach(t=>t.forEach(p=>{if(p.count>maxCount)maxCount=p.count}));
+  function rOf(c){return 3 + Math.sqrt(c/maxCount) * 9}
+
+  const NS = "http://www.w3.org/2000/svg";
+
+  for (let pi = 0; pi < N; pi++){
+    const x = xOf(pi);
+    const line = document.createElementNS(NS,"line");
+    line.setAttribute("x1",x);line.setAttribute("x2",x);
+    line.setAttribute("y1",padT-8);line.setAttribute("y2",padT+plotH+8);
+    line.setAttribute("stroke","oklch(82% 0.015 80)");
+    line.setAttribute("stroke-width",1);
+    svg.appendChild(line);
+
+    const lbl = document.createElementNS(NS,"text");
+    lbl.setAttribute("x",x);lbl.setAttribute("y",padT+plotH+22);
+    lbl.setAttribute("text-anchor","middle");
+    lbl.setAttribute("font-family","JetBrains Mono, monospace");
+    lbl.setAttribute("font-size","10.5");
+    lbl.setAttribute("letter-spacing","0.04em");
+    lbl.setAttribute("fill","oklch(38% 0.012 260)");
+    lbl.textContent = currentGran === "week" ? fmtWeek(periods[pi]) : fmtMonth(periods[pi]);
+    svg.appendChild(lbl);
+  }
+
+  [0,4,9,14].forEach(ri=>{
+    if (ri >= R) return;
+    const y = yOf(ri);
+    const lbl = document.createElementNS(NS,"text");
+    lbl.setAttribute("x",padL-14);lbl.setAttribute("y",y+4);
+    lbl.setAttribute("text-anchor","end");
+    lbl.setAttribute("font-family","JetBrains Mono, monospace");
+    lbl.setAttribute("font-size","10");
+    lbl.setAttribute("fill","oklch(55% 0.01 260)");
+    lbl.textContent = "#" + (ri+1);
+    svg.appendChild(lbl);
+  });
+
+  const catHueMap = {projects:50, entities:245, concepts:300, people:165};
+  const baseHue = catHueMap[currentCat];
+  function colorFor(title, isNewTrack){
+    let h = 0;
+    for (let i = 0; i < title.length; i++) h = ((h<<5)-h) + title.charCodeAt(i);
+    const hue = ((Math.abs(h) % 80) - 40) + baseHue;
+    const L = isNewTrack ? 55 : 48;
+    const C = isNewTrack ? 0.09 : 0.13;
+    return `oklch(${L}% ${C} ${hue})`;
+  }
+
+  const trackArr = [...tracks.entries()].map(([title, pts])=>{
+    pts.sort((a,b)=>a.pi-b.pi);
+    const totalCount = pts.reduce((s,p)=>s+p.count,0);
+    const everNew    = pts.some(p=>p.isNew);
+    return {title, pts, totalCount, everNew};
+  });
+  trackArr.sort((a,b)=>a.totalCount-b.totalCount);
+
+  trackArr.forEach(tr=>{
+    if (tr.pts.length < 2){
+      const p = tr.pts[0];
+      const c = document.createElementNS(NS,"circle");
+      c.setAttribute("cx",xOf(p.pi));
+      c.setAttribute("cy",yOf(p.rank));
+      c.setAttribute("r",rOf(p.count));
+      c.setAttribute("fill", p.isNew ? "oklch(48% 0.09 245)" : colorFor(tr.title, false));
+      c.setAttribute("fill-opacity","0.55");
+      c.setAttribute("stroke", p.isNew ? "oklch(48% 0.09 245)" : colorFor(tr.title, false));
+      c.setAttribute("stroke-width","1");
+      svg.appendChild(c);
+      return;
+    }
+    let d = "";
+    tr.pts.forEach((p,i)=>{
+      const x = xOf(p.pi), y = yOf(p.rank);
+      if (i === 0){ d += `M ${x} ${y}`; }
+      else {
+        const prev = tr.pts[i-1];
+        const px = xOf(prev.pi), py = yOf(prev.rank);
+        const cx1 = px + (x-px)/2, cx2 = cx1;
+        d += ` C ${cx1} ${py} ${cx2} ${y} ${x} ${y}`;
+      }
+    });
+    const path = document.createElementNS(NS,"path");
+    path.setAttribute("d",d);
+    path.setAttribute("fill","none");
+    const col = colorFor(tr.title, tr.everNew);
+    path.setAttribute("stroke", col);
+    const sw = 1 + Math.sqrt(tr.totalCount/maxCount)*2;
+    path.setAttribute("stroke-width", sw);
+    path.setAttribute("stroke-linecap","round");
+    path.setAttribute("stroke-linejoin","round");
+    if (tr.everNew) path.setAttribute("stroke-dasharray","5 4");
+    path.setAttribute("opacity", tr.totalCount > 3 ? "0.9" : "0.55");
+    svg.appendChild(path);
+
+    tr.pts.forEach(p=>{
+      const c = document.createElementNS(NS,"circle");
+      c.setAttribute("cx",xOf(p.pi));
+      c.setAttribute("cy",yOf(p.rank));
+      c.setAttribute("r",rOf(p.count));
+      c.setAttribute("fill","var(--paper)");
+      c.setAttribute("stroke", col);
+      c.setAttribute("stroke-width","1.5");
+      svg.appendChild(c);
+    });
+  });
+
+  const labelNodes = [];
+  trackArr.forEach(tr=>{
+    const last = tr.pts[tr.pts.length-1];
+    const placeRight = last.pi === N-1;
+    if (tr.totalCount < 3 && !placeRight) return;
+    const t = document.createElementNS(NS,"text");
+    t.setAttribute("x", xOf(last.pi) + 10);
+    t.setAttribute("y", yOf(last.rank) + 3.5);
+    t.setAttribute("font-family","Fraunces, Georgia, serif");
+    t.setAttribute("font-size", placeRight ? 13 : 11.5);
+    t.setAttribute("fill","oklch(20% 0.015 260)");
+    t.setAttribute("font-weight", placeRight ? "500" : "400");
+    t.textContent = tr.title.length > 22 ? tr.title.slice(0,21)+"…" : tr.title;
+    if (!placeRight){
+      t.setAttribute("opacity","0.45");
+      t.setAttribute("text-anchor","middle");
+      t.setAttribute("x", xOf(last.pi));
+      t.setAttribute("y", yOf(last.rank) - rOf(last.count) - 4);
+    }
+    svg.appendChild(t);
+    labelNodes.push({t, y:+t.getAttribute("y"), placeRight});
+  });
+
+  const rights = labelNodes.filter(l=>l.placeRight).sort((a,b)=>a.y-b.y);
+  const minGap = 16;
+  for (let i = 1; i < rights.length; i++){
+    const prev = rights[i-1], cur = rights[i];
+    if (cur.y - prev.y < minGap){
+      cur.y = prev.y + minGap;
+      cur.t.setAttribute("y", cur.y);
+    }
+  }
+}
+
+// ── Leaderboard ──────────────────────────────────────────────────────
+function renderLeader(){
+  const items = (D.total[currentCat]||[]).slice(0, 16);
+  const grid = document.getElementById("leader-grid");
+  const meta = CAT_META[currentCat];
+  setText("top-cat-label", "— " + meta.label.toLowerCase());
+  grid.innerHTML = "";
+  if (!items.length){ grid.appendChild(el("p","section-desc","Нет данных.")); return; }
+  items.forEach(([name, count], i)=>{
+    const row = el("div","leader-row"+(i<3?" top3":""));
+    row.innerHTML = `
+      <div class="leader-rank">${String(i+1).padStart(2,"0")}</div>
+      <div class="leader-name"><span>${escapeHtml(name)}</span><span class="dots"></span></div>
+      <div class="leader-count">${count}</div>`;
+    grid.appendChild(row);
+  });
+}
+
+// ── Novelty list ─────────────────────────────────────────────────────
+function renderNovelty(){
+  const sd = D.novelty_stacked[currentCat];
+  setText("novelty-cat-label", "— " + CAT_META[currentCat].label.toLowerCase());
+  const list = document.getElementById("novelty-list");
+  list.innerHTML = "";
+  if (!sd){ list.appendChild(el("p","section-desc","Нет данных.")); return; }
+
+  const entries = [];
+  const N = sd.periods.length;
+  sd.ranks.forEach(rank=>{
+    for (let pi = 0; pi < N; pi++){
+      const t = rank.titles[pi]; const c = rank.counts[pi];
+      if (!t || !c) continue;
+      const tag = (rank.tags||[])[pi]||{};
+      if (tag.isNew) entries.push({title:t, pi, count:c});
+    }
+  });
+  const byTitle = new Map();
+  entries.forEach(e=>{
+    const prev = byTitle.get(e.title);
+    if (!prev || prev.pi < e.pi) byTitle.set(e.title, e);
+  });
+  const rows = [...byTitle.values()].sort((a,b)=>b.pi-a.pi || b.count-a.count).slice(0, 16);
+  if (!rows.length){ list.appendChild(el("p","section-desc","На этой выборке новинок не зафиксировано.")); return; }
+
+  const meta = CAT_META[currentCat];
+  rows.forEach(r=>{
+    const when = fmtWeek(sd.periods[r.pi]);
+    const row = el("div","novelty-row");
+    const spark = el("div","novelty-spark");
+    for (let pi = 0; pi < N; pi++){
+      const tick = el("div","tick"+(pi===r.pi?" live":""));
+      const h = pi === r.pi ? 28 : (pi > r.pi ? 8 : 3);
+      tick.style.height = h + "px";
+      spark.appendChild(tick);
+    }
+    row.innerHTML = `
+      <div class="novelty-when">${when.toUpperCase()}</div>
+      <div class="novelty-name">${escapeHtml(r.title)} <em>${meta.label.toLowerCase()}</em></div>`;
+    row.appendChild(spark);
+    row.appendChild(el("div","novelty-count", String(r.count)));
+    list.appendChild(row);
+  });
+}
+
+// ── Orchestration ────────────────────────────────────────────────────
+function renderCategory(){ renderSurges(); renderBump(); renderLeader(); renderNovelty(); }
+
+function wireGran(){
+  document.querySelectorAll("#gran-btns button").forEach(b=>{
+    b.addEventListener("click",()=>{
+      document.querySelectorAll("#gran-btns button").forEach(x=>x.classList.remove("active"));
+      b.classList.add("active");
+      currentGran = b.dataset.gran;
+      renderBump();
+    });
+  });
+}
+
+function boot(){
+  fillChrome();
+  renderLede();
+  renderMeter();
+  renderCatbar();
+  renderCategory();
+  wireGran();
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+else boot();
+
+let rz;
+window.addEventListener("resize", ()=>{clearTimeout(rz);rz=setTimeout(renderBump,200)});
+
+})();
+"""
+
 
 def render_html(data: dict) -> str:
     """
-    Генерирует самодостаточный HTML: встраивает data как JS-переменную DATA,
-    Chart.js и wordcloud2.js подключаются с cdnjs (CDN).
+    Генерирует самодостаточный HTML (editorial «Weekly Briefing»).
+    Данные и app.js инлайнятся — один файл, никаких внешних ресурсов кроме
+    Google Fonts CDN (шрифты Fraunces / Geist / JetBrains Mono).
     """
-    # Безопасная сериализация: экранируем </script> внутри JSON
     js_data = json.dumps(data, ensure_ascii=False).replace("</script>", "<\\/script>")
-
-    palette_js = json.dumps(PALETTE)
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>AI Community Brain — Что обсуждали</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/wordcloud2.js/1.1.0/wordcloud2.min.js"></script>
-  <style>
-    *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:#0b0e1a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh}}
-    .header{{background:linear-gradient(135deg,#12162a 0%,#0f172a 60%,#13102a 100%);border-bottom:1px solid #1e2540;padding:26px 28px 18px}}
-    .header-inner{{max-width:1200px;margin:0 auto}}
-    .tag{{display:inline-block;background:rgba(139,92,246,.18);border:1px solid rgba(139,92,246,.35);color:#a78bfa;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:20px;margin-bottom:10px}}
-    h1{{font-size:clamp(16px,3vw,26px);font-weight:700;line-height:1.2;margin-bottom:5px;background:linear-gradient(135deg,#e2e8f0,#818cf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
-    .subtitle{{color:#475569;font-size:12px}}
-    .subtitle strong{{color:#64748b}}
-    .controls{{max-width:1200px;margin:14px auto;padding:0 24px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}}
-    .cat-btn{{padding:6px 14px;border-radius:8px;border:1px solid #2d3748;background:transparent;color:#64748b;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;white-space:nowrap}}
-    .cat-btn:hover{{border-color:#4b5563;color:#94a3b8}}
-    .cat-btn.active{{border-color:var(--c);background:color-mix(in srgb,var(--c) 12%,transparent);color:var(--c)}}
-    .cat-btn[data-cat="concepts"]{{--c:#a78bfa}}
-    .cat-btn[data-cat="entities"]{{--c:#60a5fa}}
-    .cat-btn[data-cat="people"]{{--c:#34d399}}
-    .cat-btn[data-cat="projects"]{{--c:#fb923c}}
-    .period-wrap{{display:flex;gap:5px;margin-left:auto;align-items:center;flex-wrap:wrap}}
-    .period-btn{{padding:6px 13px;border-radius:8px;border:1px solid #2d3748;background:transparent;color:#64748b;font-size:12px;cursor:pointer;transition:all .15s}}
-    .period-btn:hover{{border-color:#4b5563;color:#94a3b8}}
-    .period-btn.active{{border-color:#475569;background:#1e2540;color:#e2e8f0}}
-    select.period-select{{padding:6px 10px;border-radius:8px;border:1px solid #2d3748;background:#161b2e;color:#94a3b8;font-size:12px;cursor:pointer;outline:none;display:none}}
-    select.period-select.visible{{display:block}}
-    .top-zone{{max-width:1200px;margin:0 auto;padding:0 24px;display:grid;grid-template-columns:1fr 300px;gap:16px}}
-    @media(max-width:800px){{.top-zone{{grid-template-columns:1fr}}}}
-    .card{{background:#111827;border:1px solid #1e2540;border-radius:14px;padding:18px}}
-    .cloud-header{{display:flex;align-items:center;gap:8px;margin-bottom:12px}}
-    .cloud-title-text{{font-size:11px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:#475569}}
-    .period-badge{{margin-left:auto;font-size:11px;padding:2px 9px;border-radius:10px;border:1px solid #2d3748;color:#64748b;background:#0d1017;white-space:nowrap}}
-    #cloud-wrap{{width:100%;height:360px;position:relative}}
-    canvas#wordcloud{{width:100%;height:100%}}
-    .cloud-empty{{display:none;position:absolute;inset:0;align-items:center;justify-content:center;color:#475569;font-size:13px}}
-    .top-list-card{{display:flex;flex-direction:column;gap:6px}}
-    .top-list-title{{font-size:11px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:#475569;margin-bottom:4px}}
-    .top-item{{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #1e2540}}
-    .top-item:last-child{{border-bottom:none}}
-    .top-rank{{font-size:11px;color:#374151;width:18px;flex-shrink:0;text-align:right}}
-    .top-name{{font-size:13px;color:#94a3b8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-    .top-bar-wrap{{width:70px;flex-shrink:0;position:relative;height:6px;background:#1e2540;border-radius:3px}}
-    .top-bar-fill{{position:absolute;left:0;top:0;height:100%;border-radius:3px;transition:width .3s}}
-    .top-count{{font-size:11px;font-weight:600;color:#e2e8f0;width:28px;text-align:right;flex-shrink:0}}
-    .fw-section{{max-width:1200px;margin:16px auto 0;padding:0 24px}}
-    .chart-card{{background:#111827;border:1px solid #1e2540;border-radius:14px;padding:20px 24px}}
-    .chart-header{{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}}
-    .chart-title{{font-size:12px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:#475569;flex:1}}
-    .chart-desc{{font-size:12px;color:#374151;margin-bottom:14px}}
-    .gran-btns{{display:flex;gap:4px}}
-    .gran-btn{{padding:3px 10px;border-radius:6px;border:1px solid #2d3748;background:transparent;color:#475569;font-size:11px;cursor:pointer;transition:all .12s}}
-    .gran-btn:hover{{border-color:#374151;color:#64748b}}
-    .gran-btn.active{{border-color:#374151;background:#1e2540;color:#94a3b8}}
-    .chart-wrap-tall{{height:300px;position:relative}}
-    .chart-wrap-hot{{height:340px;position:relative}}
-    .legend-row{{display:flex;flex-wrap:wrap;gap:5px 14px;margin-top:12px}}
-    .legend-item{{display:flex;align-items:center;gap:5px;font-size:11px;color:#64748b}}
-    .legend-dot{{width:10px;height:10px;border-radius:3px;flex-shrink:0}}
-    .rising-card{{background:#111827;border:1px solid #1e2540;border-radius:14px;padding:18px 22px;margin-bottom:40px}}
-    .rising-header{{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex-wrap:wrap}}
-    .rising-title{{font-size:11px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:#475569}}
-    .rising-hint{{font-size:11px;color:#2d3748}}
-    .rising-grid{{display:flex;flex-wrap:wrap;gap:7px}}
-    .r-chip{{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:16px;font-size:12px;border:1px solid;white-space:nowrap}}
-    .r-chip .ricon{{font-size:10px}}
-    .r-chip .rname{{color:#e2e8f0}}
-    .r-chip .rcount{{font-weight:700}}
-    .r-chip .rdelta{{font-size:10px;color:#475569}}
-  </style>
-</head>
-<body data-cat="concepts">
-
-<div class="header">
-  <div class="header-inner">
-    <div class="tag">📡 Community Brain Analytics</div>
-    <h1>Что обсуждало AI-сообщество</h1>
-    <p class="subtitle"><strong>1 253 сущности</strong>, извлечённые LLM из 15 тыс. сообщений · март–апрель 2026 · 4 Telegram-канала</p>
-  </div>
-</div>
-
-<div class="controls">
-  <button class="cat-btn active" data-cat="concepts">💡 Концепции</button>
-  <button class="cat-btn" data-cat="entities">🛠 Инструменты</button>
-  <button class="cat-btn" data-cat="people">👤 Люди</button>
-  <button class="cat-btn" data-cat="projects">🚀 Проекты</button>
-  <div class="period-wrap">
-    <button class="period-btn active" data-period="total">Весь период</button>
-    <button class="period-btn" data-period="week">По неделям</button>
-    <button class="period-btn" data-period="day">По дням</button>
-    <select class="period-select" id="period-select"></select>
-  </div>
-</div>
-
-<div class="top-zone">
-  <div class="card">
-    <div class="cloud-header">
-      <span class="cloud-title-text" id="cloud-title">💡 Концепции</span>
-      <span class="period-badge" id="cloud-period-label">март–апрель 2026</span>
-    </div>
-    <div id="cloud-wrap">
-      <canvas id="wordcloud"></canvas>
-      <div class="cloud-empty" id="cloud-empty">Нет данных</div>
-    </div>
-  </div>
-  <div class="card top-list-card">
-    <div class="top-list-title" id="top-list-title">Топ — Концепции</div>
-    <div id="top-list-items"></div>
-  </div>
-</div>
-
-<div class="fw-section">
-  <div class="chart-card">
-    <div class="chart-header">
-      <span class="chart-title">📊 Все темы по периодам</span>
-      <div class="gran-btns" id="gran1-btns">
-        <button class="gran-btn active" data-gran="week">Нед.</button>
-        <button class="gran-btn" data-gran="day">Дни</button>
-        <button class="gran-btn" data-gran="month">Месяц</button>
-      </div>
-    </div>
-    <p class="chart-desc">Топ-8 сущностей + остальные. Каждый столбик = один период.</p>
-    <div class="chart-wrap-tall"><canvas id="stackedChart1"></canvas></div>
-    <div class="legend-row" id="legend1"></div>
-  </div>
-</div>
-
-<div class="fw-section" style="margin-top:14px">
-  <div class="chart-card">
-    <div class="chart-header">
-      <span class="chart-title">🔥 Горячие темы — подробно</span>
-      <div class="gran-btns" id="gran2-btns">
-        <button class="gran-btn active" data-gran="week">Нед.</button>
-        <button class="gran-btn" data-gran="day">Дни</button>
-        <button class="gran-btn" data-gran="month">Месяц</button>
-      </div>
-    </div>
-    <p class="chart-desc">Только топ-6 сущностей (без «Остальных»), с подписями прямо внутри столбиков.</p>
-    <div class="chart-wrap-hot"><canvas id="stackedChart2"></canvas></div>
-  </div>
-</div>
-
-<div class="fw-section" style="margin-top:14px">
-  <div class="rising-card">
-    <div class="rising-header">
-      <span class="rising-title" id="rising-title">🔥 Всплески последней недели</span>
-      <span class="rising-hint">число = упоминаний &nbsp;·&nbsp; +N = рост vs предыдущая неделя &nbsp;·&nbsp; ✨ = новое</span>
-    </div>
-    <div class="rising-grid" id="rising-chips"></div>
-  </div>
-</div>
-
-<script>
-// ── Данные, сгенерированные generate.py ──────────────────────────────────
-const DATA = {js_data};
-const PALETTE = {palette_js};
-const OTHERS_COLOR = "#1e2540";
-
-// ── Состояние ──────────────────────────────────────────────────────────────
-let currentCat    = "concepts";
-let currentPeriod = "total";
-let currentKey    = null;
-let gran1 = "week";
-let gran2 = "week";
-
-const catConfig = {{
-  concepts: {{ label:"💡 Концепции", color:"#a78bfa" }},
-  entities: {{ label:"🛠 Инструменты", color:"#60a5fa" }},
-  people:   {{ label:"👤 Люди",       color:"#34d399" }},
-  projects: {{ label:"🚀 Проекты",    color:"#fb923c" }},
-}};
-
-// ── Форматирование дат ─────────────────────────────────────────────────────
-function fmtDate(s) {{
-  return new Date(s).toLocaleDateString("ru-RU", {{day:"numeric", month:"short"}});
-}}
-function fmtWeek(s) {{
-  const d=new Date(s), d2=new Date(d); d2.setDate(d.getDate()+6);
-  return fmtDate(s) + "–" + fmtDate(d2.toISOString().slice(0,10));
-}}
-function fmtMonth(s) {{
-  return new Date(s+"-01").toLocaleDateString("ru-RU", {{month:"long", year:"numeric"}});
-}}
-function fmtPeriod(gran, key) {{
-  if (gran==="week")  return fmtWeek(key);
-  if (gran==="day")   return fmtDate(key);
-  if (gran==="month") return fmtMonth(key);
-  return key;
-}}
-
-// ── Получение данных по текущему состоянию ────────────────────────────────
-function getCloudData() {{
-  if (currentPeriod==="total") return DATA.total[currentCat] || [];
-  if (currentPeriod==="week")  return (DATA.weeks[currentKey] || {{}})[currentCat] || [];
-  if (currentPeriod==="day")   return (DATA.days[currentKey]  || {{}})[currentCat] || [];
-  return [];
-}}
-function getStackedData(gran) {{
-  const key = gran==="week" ? "stacked_week" : gran==="day" ? "stacked_day" : "stacked_month";
-  return DATA[key][currentCat];
-}}
-
-// ── Дропдаун выбора периода ────────────────────────────────────────────────
-function populateSelect(period) {{
-  const sel = document.getElementById("period-select");
-  sel.innerHTML = "";
-  if (period==="week") {{
-    Object.keys(DATA.weeks).sort().forEach(w => {{
-      const o=document.createElement("option"); o.value=w;
-      o.textContent="Нед. "+fmtWeek(w); sel.appendChild(o);
-    }});
-    currentKey = Object.keys(DATA.weeks).sort().at(-1);
-    sel.value = currentKey; sel.classList.add("visible");
-  }} else if (period==="day") {{
-    Object.keys(DATA.days).sort().forEach(d => {{
-      const o=document.createElement("option"); o.value=d;
-      o.textContent=fmtDate(d); sel.appendChild(o);
-    }});
-    currentKey = Object.keys(DATA.days).sort().at(-1);
-    sel.value = currentKey; sel.classList.add("visible");
-  }} else {{
-    sel.classList.remove("visible"); currentKey=null;
-  }}
-}}
-
-// ── Облако слов ────────────────────────────────────────────────────────────
-const cloudCanvas = document.getElementById("wordcloud");
-const cloudWrap   = document.getElementById("cloud-wrap");
-
-function drawCloud() {{
-  const items = getCloudData();
-  const empty = document.getElementById("cloud-empty");
-  if (!items.length) {{ empty.style.display="flex"; return; }}
-  empty.style.display = "none";
-  cloudCanvas.width  = cloudWrap.offsetWidth  || 700;
-  cloudCanvas.height = cloudWrap.offsetHeight || 360;
-  const maxC  = items[0][1];
-  const color = catConfig[currentCat].color;
-  WordCloud(cloudCanvas, {{
-    list        : items.map(([w,c]) => [w, Math.round(13+(c/maxC)*58)]),
-    gridSize    : Math.round(7*cloudCanvas.width/700),
-    fontFamily  : "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-    color       : (_,w) => w/71>.7 ? color : w/71>.4 ? color+"cc" : color+"77",
-    rotateRatio : 0.2, rotationSteps:2,
-    backgroundColor:"transparent", drawOutOfBound:false, shrinkToFit:true,
-  }});
-}}
-
-// ── Топ-список (сайдбар) ───────────────────────────────────────────────────
-function drawTopList() {{
-  const items = getCloudData().slice(0, 14);
-  const maxC  = items[0]?.[1] || 1;
-  const color = catConfig[currentCat].color;
-  const label = catConfig[currentCat].label.split(" ").slice(1).join(" ");
-  document.getElementById("top-list-title").textContent = "Топ — " + label;
-
-  const container = document.getElementById("top-list-items");
-  container.innerHTML = "";
-  items.forEach(([name, count], i) => {{
-    const pct = Math.round((count/maxC)*100);
-    const el  = document.createElement("div");
-    el.className = "top-item";
-    el.innerHTML = `
-      <span class="top-rank">${{i+1}}</span>
-      <span class="top-name" title="${{name}}">${{name}}</span>
-      <div class="top-bar-wrap"><div class="top-bar-fill" style="width:${{pct}}%;background:${{color}}"></div></div>
-      <span class="top-count">${{count}}</span>`;
-    container.appendChild(el);
-  }});
-}}
-
-// ── Stacked chart 1: все темы + легенда ───────────────────────────────────
-let chart1Inst = null;
-function drawChart1() {{
-  const sd     = getStackedData(gran1);
-  const labels = sd.periods.map(p => fmtPeriod(gran1, p));
-  const hilite = (currentPeriod==="week"||currentPeriod==="day") ? sd.periods.indexOf(currentKey) : -1;
-
-  const datasets = sd.entities.map((ent,i) => ({{
-    label:ent.length>20?ent.slice(0,18)+"…":ent, fullLabel:ent,
-    data:sd.series[ent], backgroundColor:PALETTE[i%PALETTE.length],
-    borderColor:"transparent", borderWidth:0,
-  }}));
-  if (sd.others.some(v=>v>0)) datasets.push({{
-    label:"Остальные", fullLabel:"Остальные", data:sd.others,
-    backgroundColor:OTHERS_COLOR, borderColor:"#2d3748", borderWidth:1,
-  }});
-
-  const ctx = document.getElementById("stackedChart1");
-  if (chart1Inst) chart1Inst.destroy();
-  chart1Inst = new Chart(ctx, {{
-    type:"bar", data:{{labels, datasets}},
-    options:{{
-      responsive:true, maintainAspectRatio:false,
-      interaction:{{mode:"index", intersect:false}},
-      plugins:{{
-        legend:{{display:false}},
-        tooltip:{{backgroundColor:"#1e293b",borderColor:"#334155",borderWidth:1,
-                  titleColor:"#e2e8f0",bodyColor:"#94a3b8",
-                  callbacks:{{label:c=>` ${{c.dataset.fullLabel}}: ${{c.raw}}`}}}}
-      }},
-      scales:{{
-        x:{{stacked:true, grid:{{display:false}},
-            ticks:{{color:(_,i)=>i.index===hilite?"#e2e8f0":"#475569",
-                   font:(_,i)=>{{return{{size:gran1==="day"?9:10,weight:i.index===hilite?"700":"400"}}}},
-                   maxRotation:gran1==="day"?55:0}}}},
-        y:{{stacked:true, grid:{{color:"rgba(255,255,255,0.04)"}}, ticks:{{color:"#475569",font:{{size:10}}}}}}
-      }}
-    }},
-    plugins:[{{id:"h1",beforeDraw(chart){{
-      if (hilite<0) return;
-      const {{ctx,chartArea:{{top,bottom}}}} = chart;
-      const bar = chart.getDatasetMeta(0).data[hilite];
-      if (!bar) return;
-      chart.ctx.save(); chart.ctx.fillStyle="rgba(255,255,255,0.035)";
-      chart.ctx.fillRect(bar.x-bar.width/2-2,top,bar.width+4,bottom-top); chart.ctx.restore();
-    }}}}]
-  }});
-
-  const leg = document.getElementById("legend1");
-  leg.innerHTML = "";
-  datasets.forEach(ds => {{
-    const item=document.createElement("div"); item.className="legend-item";
-    item.innerHTML=`<div class="legend-dot" style="background:${{ds.backgroundColor}}"></div>${{ds.label}}`;
-    leg.appendChild(item);
-  }});
-}}
-
-// ── Stacked chart 2: горячие темы + подписи внутри ────────────────────────
-let chart2Inst = null;
-const barLabelsPlugin = {{
-  id:"barLabels",
-  afterDraw(chart) {{
-    const {{ctx}} = chart;
-    chart.data.datasets.forEach((ds, di) => {{
-      chart.getDatasetMeta(di).data.forEach((bar, idx) => {{
-        if (!ds.data[idx]) return;
-        const segH = Math.abs(bar.base - bar.y);
-        if (segH < 15) return;
-        const lbl = ds.fullLabel || ds.label || "";
-        const maxChars = Math.max(1, Math.floor(bar.width/7));
-        const txt = lbl.length > maxChars ? lbl.slice(0, maxChars-1)+"…" : lbl;
-        ctx.save();
-        ctx.font = `600 ${{Math.min(11, segH*0.42)}}px -apple-system`;
-        ctx.fillStyle = "rgba(255,255,255,0.82)";
-        ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        ctx.fillText(txt, bar.x, bar.y + segH/2);
-        ctx.restore();
-      }});
-    }});
-  }}
-}};
-
-function drawChart2() {{
-  const sd     = getStackedData(gran2);
-  const labels = sd.periods.map(p => fmtPeriod(gran2, p));
-  const hilite = (currentPeriod==="week"||currentPeriod==="day") ? sd.periods.indexOf(currentKey) : -1;
-
-  const datasets = sd.hot_entities.map((ent,i) => ({{
-    label:ent.length>20?ent.slice(0,18)+"…":ent, fullLabel:ent,
-    data:sd.hot_series[ent], backgroundColor:PALETTE[i%PALETTE.length],
-    borderColor:"transparent", borderWidth:0,
-  }}));
-
-  const ctx = document.getElementById("stackedChart2");
-  if (chart2Inst) chart2Inst.destroy();
-  chart2Inst = new Chart(ctx, {{
-    type:"bar", data:{{labels, datasets}},
-    options:{{
-      responsive:true, maintainAspectRatio:false,
-      interaction:{{mode:"index", intersect:false}},
-      plugins:{{
-        legend:{{display:false}},
-        tooltip:{{backgroundColor:"#1e293b",borderColor:"#334155",borderWidth:1,
-                  titleColor:"#e2e8f0",bodyColor:"#94a3b8",
-                  callbacks:{{label:c=>` ${{c.dataset.fullLabel}}: ${{c.raw}}`}}}}
-      }},
-      scales:{{
-        x:{{stacked:true, grid:{{display:false}},
-            ticks:{{color:(_,i)=>i.index===hilite?"#e2e8f0":"#475569",
-                   font:(_,i)=>{{return{{size:gran2==="day"?9:10,weight:i.index===hilite?"700":"400"}}}},
-                   maxRotation:gran2==="day"?55:0}}}},
-        y:{{stacked:true, grid:{{color:"rgba(255,255,255,0.04)"}}, ticks:{{color:"#475569",font:{{size:10}}}}}}
-      }}
-    }},
-    plugins:[barLabelsPlugin, {{id:"h2",beforeDraw(chart){{
-      if (hilite<0) return;
-      const {{ctx,chartArea:{{top,bottom}}}} = chart;
-      const bar = chart.getDatasetMeta(0).data[hilite];
-      if (!bar) return;
-      chart.ctx.save(); chart.ctx.fillStyle="rgba(255,255,255,0.04)";
-      chart.ctx.fillRect(bar.x-bar.width/2-2,top,bar.width+4,bottom-top); chart.ctx.restore();
-    }}}}]
-  }});
-}}
-
-// ── Всплески ───────────────────────────────────────────────────────────────
-function drawRising() {{
-  const weeks = Object.keys(DATA.weeks).sort();
-  const chips = document.getElementById("rising-chips");
-  chips.innerHTML = "";
-  if (!weeks.length) return;
-  const last = weeks.at(-1), prev = weeks.at(-2);
-  document.getElementById("rising-title").textContent = `🔥 Всплески — нед. ${{fmtWeek(last)}}`;
-  const lastData = (DATA.weeks[last]||{{}})[currentCat]||[];
-  const prevMap  = Object.fromEntries(((DATA.weeks[prev]||{{}})[currentCat]||[]).map(([t,c])=>[t,c]));
-  const cfg = catConfig[currentCat];
-  lastData.map(([t,c])=>{{return{{t,c,delta:c-(prevMap[t]||0),isNew:!(prevMap[t])}};}})
-    .filter(x=>x.delta>0||x.isNew).sort((a,b)=>b.delta-a.delta).slice(0,22)
-    .forEach(({{t,c,delta,isNew}})=>{{
-      const chip=document.createElement("div"); chip.className="r-chip";
-      chip.style.borderColor=cfg.color+"40"; chip.style.background=cfg.color+"0d";
-      chip.innerHTML=`<span class="ricon">${{isNew?"✨":"↑"}}</span><span class="rname">${{t}}</span><span class="rcount" style="color:${{cfg.color}}">${{c}}</span>${{!isNew?`<span class="rdelta">+${{delta}}</span>`:""}}`;
-      chips.appendChild(chip);
-    }});
-}}
-
-// ── Обновление подписей ────────────────────────────────────────────────────
-function updateLabels() {{
-  document.getElementById("cloud-title").textContent = catConfig[currentCat].label;
-  let lbl = "март–апрель 2026";
-  if (currentPeriod==="week"&&currentKey) lbl="Нед. "+fmtWeek(currentKey);
-  if (currentPeriod==="day" &&currentKey) lbl=fmtDate(currentKey);
-  document.getElementById("cloud-period-label").textContent = lbl;
-  document.body.dataset.cat = currentCat;
-}}
-
-// ── Полный рендер ─────────────────────────────────────────────────────────
-function render() {{
-  updateLabels(); drawCloud(); drawTopList(); drawChart1(); drawChart2(); drawRising();
-}}
-
-// ── События ───────────────────────────────────────────────────────────────
-document.querySelectorAll(".cat-btn").forEach(btn=>btn.addEventListener("click",()=>{{
-  document.querySelectorAll(".cat-btn").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active"); currentCat=btn.dataset.cat; render();
-}}));
-document.querySelectorAll(".period-btn").forEach(btn=>btn.addEventListener("click",()=>{{
-  document.querySelectorAll(".period-btn").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active"); currentPeriod=btn.dataset.period;
-  populateSelect(currentPeriod); render();
-}}));
-document.getElementById("period-select").addEventListener("change",e=>{{ currentKey=e.target.value; render(); }});
-document.querySelectorAll("#gran1-btns .gran-btn").forEach(btn=>btn.addEventListener("click",()=>{{
-  document.querySelectorAll("#gran1-btns .gran-btn").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active"); gran1=btn.dataset.gran; drawChart1();
-}}));
-document.querySelectorAll("#gran2-btns .gran-btn").forEach(btn=>btn.addEventListener("click",()=>{{
-  document.querySelectorAll("#gran2-btns .gran-btn").forEach(b=>b.classList.remove("active"));
-  btn.classList.add("active"); gran2=btn.dataset.gran; drawChart2();
-}}));
-window.addEventListener("load",   ()=>setTimeout(render, 120));
-window.addEventListener("resize", ()=>setTimeout(drawCloud, 150));
-</script>
-</body>
-</html>"""
+    return (
+        _HTML_TEMPLATE
+        .replace("__DATA_JSON__", js_data)
+        .replace("__APP_JS__", _APP_JS)
+    )
