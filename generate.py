@@ -1164,7 +1164,8 @@ body[data-serif=instrument] {--serif:"Instrument Serif", Georgia, serif}
 
   <!-- ══════ DATELINE ══════ -->
   <div class="dateline">
-    <span>Источник: <b>Telegram · AI-каналы</b></span>
+    <span>Источник: <b>Telegram</b></span>
+    <span>Каналы: <b>Поляков считает и болтает</b>, <b>Чатик мыслителей</b>, <b>Чат Kovalskii</b>, <b>Промптинг</b></span>
     <span>Неделя <b id="dl-week">—</b></span>
     <span>Пред. <b id="dl-prev">—</b></span>
     <span style="margin-left:auto">alias <code style="font-family:inherit">aliases.yml</code></span>
