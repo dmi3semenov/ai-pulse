@@ -17,3 +17,6 @@ out/dashboard_*.html
 
 # Claude Design handoff exports — локальные артефакты, не коммитятся
 .design-bundle/
+
+# Claude Code local settings
+.claude/
