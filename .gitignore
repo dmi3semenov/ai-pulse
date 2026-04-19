@@ -12,6 +12,10 @@ wheels/
 # macOS
 .DS_Store
 
+# Secrets
+.env
+.env.*
+
 # Generated dashboards (timestamped builds); старый out/dashboard.html сохранён как v1
 out/dashboard_*.html
 
