@@ -37,12 +37,25 @@ CATEGORIES = ["projects", "tools", "platforms", "models", "concepts", "people"]
 
 # Иконки и цвета категорий — используются в UI и передаются в JS.
 CATEGORY_META = {
-    "projects":  {"icon": "🚀", "label": "Проекты",     "color": "#fb923c"},
+    "projects":  {"icon": "🚀", "label": "Инициативы",   "color": "#fb923c"},
     "tools":     {"icon": "🛠", "label": "Инструменты", "color": "#60a5fa"},
     "platforms": {"icon": "🌐", "label": "Платформы",   "color": "#22d3ee"},
     "models":    {"icon": "🧠", "label": "Модели",      "color": "#eab308"},
     "concepts":  {"icon": "💡", "label": "Концепции",   "color": "#a78bfa"},
     "people":    {"icon": "👤", "label": "Люди",        "color": "#34d399"},
+}
+
+# Минимальное число упоминаний за период, чтобы сущность попала в графики
+# (hot-topics, novelty, hero-KPI). В плотных категориях (инструменты, модели,
+# проекты) порог 2 отсекает одноразовый шум. В «Люди» внешних фигур мало и
+# упоминаются они редко — при пороге 2 график пустеет, поэтому 1.
+CATEGORY_MIN_COUNT = {
+    "projects":  2,
+    "tools":     2,
+    "platforms": 2,
+    "models":    2,
+    "concepts":  2,
+    "people":    1,
 }
 
 # Палитра для сегментов стекового графика: 10 разнесённых по hue-колесу
@@ -479,7 +492,7 @@ def _surge_items(agg: dict, cat: str, last: str, prev: str | None) -> list[dict]
     return items
 
 
-def make_hero_stats(agg: dict, min_count: int = 2) -> dict:
+def make_hero_stats(agg: dict) -> dict:
     """
     KPI-строка для hero-стрипа сверху дашборда. Считает на последнюю неделю:
       - сколько сущностей впервые появилось (с разбивкой по категориям)
@@ -487,8 +500,9 @@ def make_hero_stats(agg: dict, min_count: int = 2) -> dict:
       - сколько упало (delta < 0)
       - какая сущность дала самый большой прирост (delta ↑) — имя + категория.
 
-    Фильтр min_count=2 согласован с Novelty/Hot-topics графиками: одноразовый
-    шум не учитываем.
+    Фильтр min_count по категориям (CATEGORY_MIN_COUNT) согласован с
+    Novelty/Hot-topics графиками: одноразовый шум не учитываем, но для «Люди»
+    порог 1 (иначе метрики часто пустые).
     """
     last, prev = _last_two_weeks(agg)
     zero_counts = {cat: 0 for cat in CATEGORIES}
@@ -507,10 +521,11 @@ def make_hero_stats(agg: dict, min_count: int = 2) -> dict:
     top_gainer: dict | None = None
 
     for cat in CATEGORIES:
+        cat_min = CATEGORY_MIN_COUNT[cat]
         cur_map  = agg["week"][cat].get(last, {})
         prev_map = agg["week"][cat].get(prev, {}) if prev else {}
         for title, count in cur_map.items():
-            if count < min_count:
+            if count < cat_min:
                 continue
             prev_count = prev_map.get(title, 0)
             delta = count - prev_count
@@ -595,13 +610,13 @@ def build_data(data_dir: str, wiki_pages_dir: str) -> dict:
     total_data = {cat: top_n(agg["total"][cat]) for cat in CATEGORIES}
 
     # Stacked «горячие темы» — недели + месяцы.
-    stacked_week  = {cat: make_stacked(cat, agg, "week")  for cat in CATEGORIES}
-    stacked_month = {cat: make_stacked(cat, agg, "month") for cat in CATEGORIES}
+    stacked_week  = {cat: make_stacked(cat, agg, "week",  min_count=CATEGORY_MIN_COUNT[cat]) for cat in CATEGORIES}
+    stacked_month = {cat: make_stacked(cat, agg, "month", min_count=CATEGORY_MIN_COUNT[cat]) for cat in CATEGORIES}
 
     # Stacked «новинки» — только то, что появилось ВПЕРВЫЕ в данную неделю
     # (prev_count == 0). Недельная разбивка; месяцы бессмысленны на коротком
     # окне данных.
-    novelty_stacked = {cat: make_novelty_stacked(cat, agg) for cat in CATEGORIES}
+    novelty_stacked = {cat: make_novelty_stacked(cat, agg, min_count=CATEGORY_MIN_COUNT[cat]) for cat in CATEGORIES}
 
     # Per-категорийный блок всплесков (чипы во вкладке категории) и hero-KPI.
     category_surges = make_category_surges(agg)
@@ -1094,8 +1109,10 @@ body{
 .leader-row.top3 .leader-rank{color:var(--red);font-weight:600}
 .leader-name{
   font-family:var(--sans);font-size:14.5px;color:var(--ink);font-weight:500;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  display:flex;align-items:baseline;gap:8px;
+  display:flex;align-items:baseline;gap:8px;min-width:0;
+}
+.leader-name > span:first-child{
+  overflow-wrap:anywhere;word-break:break-word;max-width:100%;
 }
 .leader-name .dots{
   flex:1;border-bottom:1px dotted var(--rule);
@@ -1281,9 +1298,7 @@ body[data-serif=instrument] {--serif:"Instrument Serif", Georgia, serif}
     </div>
     <div>
       <h4>Сборка</h4>
-      Собрано: <span id="col-built">—</span><br>
-      Алиасы: <code>aliases.yml</code><br>
-      Исключения: <code>excluded.yml</code>
+      Собрано: <span id="col-built">—</span>
     </div>
   </footer>
 </div>
@@ -1302,7 +1317,7 @@ _APP_JS = r"""
 
 const D = window.DATA;
 const CAT_META = {
-  projects:  {label:"Проекты",     kicker:"§ Projects",  var:"--cat-projects"},
+  projects:  {label:"Инициативы",   kicker:"§ Initiatives", var:"--cat-projects"},
   tools:     {label:"Инструменты", kicker:"§ Tools",     var:"--cat-tools"},
   platforms: {label:"Платформы",   kicker:"§ Platforms", var:"--cat-platforms"},
   models:    {label:"Модели",      kicker:"§ Models",    var:"--cat-models"},
