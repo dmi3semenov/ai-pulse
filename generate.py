@@ -33,7 +33,7 @@ import yaml  # pyyaml — для чтения YAML frontmatter wiki-страни
 # С апреля 2026 community-brain разделил старый «entities» на три: tools,
 # platforms, models. Старая папка entities теперь пустая (держать в списке
 # смысла нет — иначе колонка табов пустая).
-CATEGORIES = ["projects", "tools", "platforms", "models", "concepts", "people"]
+CATEGORIES = ["tools", "models", "platforms", "concepts", "people", "projects"]
 
 # Иконки и цвета категорий — используются в UI и передаются в JS.
 CATEGORY_META = {
@@ -1324,7 +1324,7 @@ const CAT_META = {
   concepts:  {label:"Концепции",   kicker:"§ Concepts",  var:"--cat-concepts"},
   people:    {label:"Люди",        kicker:"§ People",    var:"--cat-people"}
 };
-const CAT_ORDER = ["projects","tools","platforms","models","concepts","people"];
+const CAT_ORDER = ["tools","models","platforms","concepts","people","projects"];
 const CAT_COLOR = {
   projects: "oklch(52% 0.14 50)",
   tools:    "oklch(48% 0.09 245)",
@@ -1334,7 +1334,7 @@ const CAT_COLOR = {
   people:   "oklch(50% 0.10 165)"
 };
 
-let currentCat  = "projects";
+let currentCat  = "tools";
 let currentGran = "week";
 
 // ── Format ───────────────────────────────────────────────────────────
@@ -1396,14 +1396,24 @@ function renderMeter(){
   meter.innerHTML = "";
   if (!h || !h.week){ meter.appendChild(el("div","meter-cell","Нет данных")); return; }
 
-  function breakdown(byCat){
+  // Расшифровка, что означает каждый большой KPI — показывается в title
+  // при наведении на ячейку. Разбивка «инст. 14» тоже получает тултип с
+  // полным названием категории + счётом.
+  const TONE_DESC = {
+    new:     "сущностей впервые появилось на этой неделе",
+    rising:  "сущностей выросли по упоминаниям (delta>0 к прошлой неделе)",
+    falling: "сущностей упали по упоминаниям (delta<0 к прошлой неделе)",
+  };
+  function breakdown(byCat, total, tone){
     const wrap = el("div","meter-breakdown");
+    const verb = tone === "new" ? "новых" : (tone === "rising" ? "растущих" : "падающих");
     for (const c of CAT_ORDER){
       const n = byCat[c]||0;
       if (!n) continue;
       const bd = el("span","bd");
       bd.style.setProperty("--bd-c", CAT_COLOR[c]);
       bd.textContent = `${CAT_META[c].label.slice(0,4).toLowerCase()}. ${n}`;
+      bd.title = `${CAT_META[c].label}: ${n} из ${total} ${verb}`;
       wrap.appendChild(bd);
     }
     return wrap;
@@ -1411,6 +1421,7 @@ function renderMeter(){
   function cell(tone, label, glyph, val, extra){
     const c = el("div","meter-cell");
     c.dataset.tone = tone;
+    if (TONE_DESC[tone]) c.title = `${val} ${TONE_DESC[tone]}`;
     const lbl = el("div","meter-label");
     lbl.appendChild(el("span","",label));
     lbl.appendChild(el("span","glyph",glyph));
@@ -1419,9 +1430,9 @@ function renderMeter(){
     if (extra) c.appendChild(extra);
     return c;
   }
-  meter.appendChild(cell("new",    "Новинок", "N", h.new.total,    breakdown(h.new.by_cat)));
-  meter.appendChild(cell("rising", "Растут",  "↗", h.rising.total, breakdown(h.rising.by_cat)));
-  meter.appendChild(cell("falling","Падают",  "↘", h.falling.total,breakdown(h.falling.by_cat)));
+  meter.appendChild(cell("new",    "Новинок", "N", h.new.total,    breakdown(h.new.by_cat,    h.new.total,    "new")));
+  meter.appendChild(cell("rising", "Растут",  "↗", h.rising.total, breakdown(h.rising.by_cat, h.rising.total, "rising")));
+  meter.appendChild(cell("falling","Падают",  "↘", h.falling.total,breakdown(h.falling.by_cat,h.falling.total,"falling")));
 
   const g = h.top_gainer;
   const gc = el("div","meter-cell");
