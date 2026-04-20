@@ -30,14 +30,19 @@ import yaml  # pyyaml — для чтения YAML frontmatter wiki-страни
 
 # ── Категории сущностей (совпадают с папками в wiki/pages/) ─────────────────
 # Порядок здесь определяет порядок табов и дефолтную категорию (первая = by default).
-CATEGORIES = ["projects", "entities", "concepts", "people"]
+# С апреля 2026 community-brain разделил старый «entities» на три: tools,
+# platforms, models. Старая папка entities теперь пустая (держать в списке
+# смысла нет — иначе колонка табов пустая).
+CATEGORIES = ["projects", "tools", "platforms", "models", "concepts", "people"]
 
 # Иконки и цвета категорий — используются в UI и передаются в JS.
 CATEGORY_META = {
-    "projects": {"icon": "🚀", "label": "Проекты",    "color": "#fb923c"},
-    "entities": {"icon": "🛠", "label": "Инструменты","color": "#60a5fa"},
-    "concepts": {"icon": "💡", "label": "Концепции",  "color": "#a78bfa"},
-    "people":   {"icon": "👤", "label": "Люди",       "color": "#34d399"},
+    "projects":  {"icon": "🚀", "label": "Проекты",     "color": "#fb923c"},
+    "tools":     {"icon": "🛠", "label": "Инструменты", "color": "#60a5fa"},
+    "platforms": {"icon": "🌐", "label": "Платформы",   "color": "#22d3ee"},
+    "models":    {"icon": "🧠", "label": "Модели",      "color": "#eab308"},
+    "concepts":  {"icon": "💡", "label": "Концепции",   "color": "#a78bfa"},
+    "people":    {"icon": "👤", "label": "Люди",        "color": "#34d399"},
 }
 
 # Палитра для сегментов стекового графика: 10 разнесённых по hue-колесу
@@ -655,10 +660,12 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   --blue-soft:    oklch(48% 0.09 245 / 0.1);
   --grey:         oklch(55% 0.005 260);  /* falling */
 
-  --cat-projects: oklch(52% 0.14 50);
-  --cat-entities: oklch(48% 0.09 245);
-  --cat-concepts: oklch(46% 0.12 300);
-  --cat-people:   oklch(50% 0.10 165);
+  --cat-projects:  oklch(52% 0.14 50);
+  --cat-tools:     oklch(48% 0.09 245);
+  --cat-platforms: oklch(55% 0.11 200);
+  --cat-models:    oklch(58% 0.12 80);
+  --cat-concepts:  oklch(46% 0.12 300);
+  --cat-people:    oklch(50% 0.10 165);
 
   --serif:  "Fraunces", "Instrument Serif", Georgia, serif;
   --sans:   "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -948,10 +955,12 @@ body{
   content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;
   background:var(--cat-c);
 }
-.cat-btn[data-cat=projects]{--cat-c:var(--cat-projects)}
-.cat-btn[data-cat=entities]{--cat-c:var(--cat-entities)}
-.cat-btn[data-cat=concepts]{--cat-c:var(--cat-concepts)}
-.cat-btn[data-cat=people]  {--cat-c:var(--cat-people)}
+.cat-btn[data-cat=projects] {--cat-c:var(--cat-projects)}
+.cat-btn[data-cat=tools]    {--cat-c:var(--cat-tools)}
+.cat-btn[data-cat=platforms]{--cat-c:var(--cat-platforms)}
+.cat-btn[data-cat=models]   {--cat-c:var(--cat-models)}
+.cat-btn[data-cat=concepts] {--cat-c:var(--cat-concepts)}
+.cat-btn[data-cat=people]   {--cat-c:var(--cat-people)}
 
 .cat-btn .cat-kicker{
   font-family:var(--mono);
@@ -1277,17 +1286,21 @@ _APP_JS = r"""
 
 const D = window.DATA;
 const CAT_META = {
-  projects: {label:"Проекты",     kicker:"§ Projects", var:"--cat-projects"},
-  entities: {label:"Инструменты", kicker:"§ Tools",    var:"--cat-entities"},
-  concepts: {label:"Концепции",   kicker:"§ Concepts", var:"--cat-concepts"},
-  people:   {label:"Люди",        kicker:"§ People",   var:"--cat-people"}
+  projects:  {label:"Проекты",     kicker:"§ Projects",  var:"--cat-projects"},
+  tools:     {label:"Инструменты", kicker:"§ Tools",     var:"--cat-tools"},
+  platforms: {label:"Платформы",   kicker:"§ Platforms", var:"--cat-platforms"},
+  models:    {label:"Модели",      kicker:"§ Models",    var:"--cat-models"},
+  concepts:  {label:"Концепции",   kicker:"§ Concepts",  var:"--cat-concepts"},
+  people:    {label:"Люди",        kicker:"§ People",    var:"--cat-people"}
 };
-const CAT_ORDER = ["projects","entities","concepts","people"];
+const CAT_ORDER = ["projects","tools","platforms","models","concepts","people"];
 const CAT_COLOR = {
-  projects:"oklch(52% 0.14 50)",
-  entities:"oklch(48% 0.09 245)",
-  concepts:"oklch(46% 0.12 300)",
-  people:  "oklch(50% 0.10 165)"
+  projects: "oklch(52% 0.14 50)",
+  tools:    "oklch(48% 0.09 245)",
+  platforms:"oklch(55% 0.11 200)",
+  models:   "oklch(58% 0.12 80)",
+  concepts: "oklch(46% 0.12 300)",
+  people:   "oklch(50% 0.10 165)"
 };
 
 let currentCat  = "projects";
@@ -1549,7 +1562,7 @@ function renderBump(){
     svg.appendChild(lbl);
   });
 
-  const catHueMap = {projects:50, entities:245, concepts:300, people:165};
+  const catHueMap = {projects:50, tools:245, platforms:200, models:80, concepts:300, people:165};
   const baseHue = catHueMap[currentCat];
   function colorFor(title, isNewTrack){
     let h = 0;
