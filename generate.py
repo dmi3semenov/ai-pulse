@@ -406,19 +406,31 @@ def make_novelty_stacked(
     min_count:    int = 2,
 ) -> dict:
     """
-    Новинки как stacked-бар: только сущности, впервые появившиеся именно в
-    этой неделе (prev_count == 0). Фильтр min_count=2 убирает одноразовый шум.
+    Новинки как stacked-бар: сущности, впервые появившиеся в окне именно в
+    этой неделе (до этого ни в одной из предыдущих недель окна их не было).
+    Фильтр min_count=2 убирает одноразовый шум.
+
+    Важно: именно «впервые в окне», а не week-over-week. Если сущность
+    мелькнула в начале окна, пропала на пару недель и вернулась — это НЕ
+    новинка (пользователь её уже видел). isNew из _delta_isnew_tags такие
+    случаи пропускает, поэтому здесь считаем first_seen самостоятельно.
     """
     all_weeks = sorted(w for w in agg["week"][cat] if w >= SINCE)
     periods   = all_weeks[-weeks_limit:]
     tags      = _delta_isnew_tags(agg["week"][cat], all_weeks, periods)
+
+    # first_seen[title] — самая ранняя неделя, где у сущности был count > 0.
+    first_seen: dict[str, str] = {}
+    for w in all_weeks:
+        for t in agg["week"][cat].get(w, {}):
+            first_seen.setdefault(t, w)
 
     return _build_rank_series(
         periods,
         agg["week"][cat],
         agg["total"][cat],
         top_n,
-        filter_fn=lambda t, c, p: c >= min_count and tags.get((p, t), {}).get("isNew", False),
+        filter_fn=lambda t, c, p: c >= min_count and first_seen.get(t) == p,
         tag_fn=lambda t, c, p: tags.get((p, t), {"delta": c, "isNew": True}),
     )
 
