@@ -201,6 +201,11 @@ def load_wiki_entities(
             source_ids = meta.get("source_ids") or []
             if not title or not source_ids:
                 continue
+            # В категории «people» держим только публичных (external). Участники
+            # чатов (internal) засоряют топ — их много упоминают внутри своих
+            # же сообществ, это дублирует сигнал from-chat в людей-как-сущности.
+            if cat == "people" and meta.get("affiliation") != "external":
+                continue
             raw_entries.append((cat, normalize_title(title, aliases), list(source_ids)))
 
     # Второй проход: схлопываем одноимённые (после нормализации) wiki-страницы.
