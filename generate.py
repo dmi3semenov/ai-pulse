@@ -1514,6 +1514,17 @@ function renderBump(){
     line.setAttribute("stroke-width",1);
     svg.appendChild(line);
 
+    // Лёгкая «решётка» 15 рангов — показывает, что слот предусмотрен даже
+    // если в нём нет данных (так видно, где просто не набралось тем).
+    for (let ri = 0; ri < R; ri++){
+      const dot = document.createElementNS(NS,"circle");
+      dot.setAttribute("cx", x);
+      dot.setAttribute("cy", yOf(ri));
+      dot.setAttribute("r", 1.5);
+      dot.setAttribute("fill", "oklch(82% 0.015 80)");
+      svg.appendChild(dot);
+    }
+
     const lbl = document.createElementNS(NS,"text");
     lbl.setAttribute("x",x);lbl.setAttribute("y",padT+plotH+22);
     lbl.setAttribute("text-anchor","middle");
@@ -1607,36 +1618,68 @@ function renderBump(){
     });
   });
 
-  const labelNodes = [];
+  // ── Labels — каждая точка в каждом столбце получает подпись.
+  // Правая колонка (последняя неделя): подписи справа от точки.
+  // Остальные столбцы: подписи сверху от точки (над окружностью).
+  // Для каждой колонки — отдельный пас с разрешением вертикальных коллизий.
+  const labelsByCol = Array.from({length:N}, ()=>[]);
   trackArr.forEach(tr=>{
-    const last = tr.pts[tr.pts.length-1];
-    const placeRight = last.pi === N-1;
-    if (tr.totalCount < 3 && !placeRight) return;
-    const t = document.createElementNS(NS,"text");
-    t.setAttribute("x", xOf(last.pi) + 10);
-    t.setAttribute("y", yOf(last.rank) + 3.5);
-    t.setAttribute("font-family","Fraunces, Georgia, serif");
-    t.setAttribute("font-size", placeRight ? 13 : 11.5);
-    t.setAttribute("fill","oklch(20% 0.015 260)");
-    t.setAttribute("font-weight", placeRight ? "500" : "400");
-    t.textContent = tr.title.length > 22 ? tr.title.slice(0,21)+"…" : tr.title;
-    if (!placeRight){
-      t.setAttribute("opacity","0.45");
-      t.setAttribute("text-anchor","middle");
-      t.setAttribute("x", xOf(last.pi));
-      t.setAttribute("y", yOf(last.rank) - rOf(last.count) - 4);
-    }
-    svg.appendChild(t);
-    labelNodes.push({t, y:+t.getAttribute("y"), placeRight});
+    tr.pts.forEach(p=>{
+      const placeRight = p.pi === N-1;
+      const t = document.createElementNS(NS,"text");
+      t.setAttribute("font-family","Fraunces, Georgia, serif");
+      t.setAttribute("fill","oklch(20% 0.015 260)");
+      const shortName = tr.title.length > 22 ? tr.title.slice(0,21)+"…" : tr.title;
+      t.textContent = shortName;
+      if (placeRight){
+        t.setAttribute("x", xOf(p.pi) + 10);
+        t.setAttribute("y", yOf(p.rank) + 3.5);
+        t.setAttribute("font-size", 13);
+        t.setAttribute("font-weight", "500");
+        t.setAttribute("text-anchor","start");
+      } else {
+        t.setAttribute("x", xOf(p.pi));
+        t.setAttribute("y", yOf(p.rank) - rOf(p.count) - 4);
+        t.setAttribute("font-size", 10.5);
+        t.setAttribute("font-weight", "400");
+        t.setAttribute("text-anchor","middle");
+        t.setAttribute("opacity", tr.totalCount >= 3 ? "0.72" : "0.48");
+      }
+      svg.appendChild(t);
+      labelsByCol[p.pi].push({
+        t,
+        rank: p.rank,
+        count: p.count,
+        y: +t.getAttribute("y"),
+        placeRight
+      });
+    });
   });
 
-  const rights = labelNodes.filter(l=>l.placeRight).sort((a,b)=>a.y-b.y);
-  const minGap = 16;
+  // Разрешение коллизий по каждой колонке.
+  // Правая колонка — классический вертикальный stacking по 16px.
+  // Средние — если соседние ранги идут подряд, нижнюю подпись смещаем ПОД точку.
+  const minGap = 14;
+
+  const rights = labelsByCol[N-1].slice().sort((a,b)=>a.y-b.y);
   for (let i = 1; i < rights.length; i++){
     const prev = rights[i-1], cur = rights[i];
     if (cur.y - prev.y < minGap){
       cur.y = prev.y + minGap;
       cur.t.setAttribute("y", cur.y);
+    }
+  }
+
+  for (let pi = 0; pi < N - 1; pi++){
+    const col = labelsByCol[pi].slice().sort((a,b)=>a.rank-b.rank);
+    for (let i = 0; i < col.length; i++){
+      const cur = col[i];
+      const prev = i > 0 ? col[i-1] : null;
+      if (prev && Math.abs(cur.rank - prev.rank) <= 1){
+        const newY = yOf(cur.rank) + rOf(cur.count) + 11;
+        cur.t.setAttribute("y", newY);
+        cur.y = newY;
+      }
     }
   }
 }
